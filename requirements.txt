@@ -1,0 +1,14 @@
+# aimastering-rendition-dsp: 14-Stage Mastering Chain
+
+# Signal processing
+numpy>=1.26,<2.0
+scipy>=1.12,<2.0
+soundfile>=0.12,<1.0
+
+# API framework
+fastapi>=0.110,<1.0
+uvicorn>=0.29,<1.0
+python-multipart>=0.0.9,<1.0
+
+# URL-based audio fetch (bypass 32MB Cloud Run limit)
+httpx>=0.27,<1.0
