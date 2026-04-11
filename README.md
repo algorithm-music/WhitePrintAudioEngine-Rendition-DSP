@@ -14,7 +14,7 @@
 ```bash
 gcloud run deploy aimastering-rendition-dsp \
   --source . --region asia-northeast1 \
-  --memory 2Gi --cpu 2 --concurrency 1 --timeout 600 --ingress internal
+  --memory 4Gi --cpu 2 --concurrency 1 --timeout 600 --ingress internal
 ```
 
 © YOMIBITO SHIRAZU — WhitePrintAudioEngine

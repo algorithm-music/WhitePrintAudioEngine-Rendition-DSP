@@ -197,34 +197,21 @@ def _apply_full_chain(
     left *= gain_linear
     right *= gain_linear
 
-    # ③ Transformer Saturation (odd harmonics, 8x OS)
-    left = _apply_transformer(left, sr, params)
-    right = _apply_transformer(right, sr, params)
+    # ③④⑤ Saturation Chain (single 8x OS session — prevents cumulative pre-ringing)
+    left = _apply_saturation_chain(left, sr, params)
+    right = _apply_saturation_chain(right, sr, params)
 
-    # ④ Triode Tube (Koren model, 8x OS)
-    left = _apply_triode(left, sr, params)
-    right = _apply_triode(right, sr, params)
+    # ⑦ Parametric EQ (L/R space — avoids M/S IIR phase mismatch / comb filtering)
+    left = _apply_parametric_eq(left, sr, params, "mid")
+    right = _apply_parametric_eq(right, sr, params, "mid")
 
-    # ⑤ Tape Emulation (compression + head bump + HF rolloff, 8x OS)
-    left = _apply_tape(left, sr, params)
-    right = _apply_tape(right, sr, params)
+    # ⑧ Dynamic EQ (L/R space)
+    left = _apply_dynamic_eq(left, sr, params)
+    right = _apply_dynamic_eq(right, sr, params)
 
-    # ⑥ M/S Encode (after saturation, before EQs/Comps)
+    # ⑥ M/S Encode (after EQ, for stereo width control only)
     mid = (left + right) * 0.5
     side = (left - right) * 0.5
-
-    # ⑦ Parametric EQ (AI-controlled 4-band)
-    mid = _apply_parametric_eq(mid, sr, params, "mid")
-    side = _apply_parametric_eq(side, sr, params, "side")
-
-    # ⑧ Dynamic EQ (frequency-selective compression)
-    mid = _apply_dynamic_eq(mid, sr, params)
-    side = _apply_dynamic_eq(side, sr, params)
-
-    # ⑩ Parallel Drive (tanh saturation + HPF + air shelf)
-    parallel_wet = params.get("parallel_wet", 0.18)
-    mid = _neuro_drive(mid, sr, wet=parallel_wet)
-    side = _neuro_drive(side, sr, wet=parallel_wet)
 
     # ⑪ Frequency-Dependent Stereo Width (operates on M/S pair)
     mid, side = _apply_freq_dep_width(mid, side, sr, params)
@@ -233,7 +220,12 @@ def _apply_full_chain(
     out_left = mid + side
     out_right = mid - side
 
-    # ⑨ 4-Band Multiband Compressor (Stereo-linked, L/R applied to avoid M/S pumping)
+    # ⑩ Parallel Drive (L/R space — avoids M/S harmonic scatter)
+    parallel_wet = params.get("parallel_wet", 0.18)
+    out_left = _neuro_drive(out_left, sr, wet=parallel_wet)
+    out_right = _neuro_drive(out_right, sr, wet=parallel_wet)
+
+    # ⑨ 4-Band Multiband Compressor (Stereo-linked, L/R)
     out_left, out_right = _apply_multiband_comp_stereo(out_left, out_right, sr, params)
 
     # ⑫ Soft Clipper (L/R applied to avoid stereo phase distortion)
@@ -271,6 +263,111 @@ def _remove_dc(buf: np.ndarray, sr: int) -> np.ndarray:
 # ══════════════════════════════════════════
 # ③ Transformer Saturation (tanh waveshaper)
 # ══════════════════════════════════════════
+def _apply_saturation_chain(buf: np.ndarray, sr: int, params: dict) -> np.ndarray:
+    """③④⑤ Combined saturation in a single 8x OS session.
+
+    Upsample once → Transformer → Triode → Tape → Downsample once.
+    Eliminates cumulative FIR pre-ringing from 3 separate OS passes.
+    """
+    # Check if all stages are bypassed
+    t_sat = params.get("transformer_saturation", 0.3)
+    t_mix = params.get("transformer_mix", 0.4)
+    tr_drive = params.get("triode_drive", 0.4)
+    tr_mix = params.get("triode_mix", 0.5)
+    tp_sat = params.get("tape_saturation", 0.3)
+    tp_mix = params.get("tape_mix", 0.4)
+
+    if (t_sat < 0.01 and t_mix < 0.01 and
+        tr_drive < 0.01 and tr_mix < 0.01 and
+        tp_sat < 0.01 and tp_mix < 0.01):
+        return buf
+
+    # Single upsample
+    up = resample_poly(buf, 8, 1)
+    sr_up = sr * 8
+
+    # ③ Transformer (tanh waveshaper)
+    if t_sat >= 0.01 or t_mix >= 0.01:
+        up = _transformer_core(up, sr_up, t_sat, t_mix)
+
+    # ④ Triode (Koren model)
+    if tr_drive >= 0.01 or tr_mix >= 0.01:
+        up = _triode_core(up, sr_up, params)
+
+    # ⑤ Tape (arctan + head bump + HF rolloff)
+    if tp_sat >= 0.01 or tp_mix >= 0.01:
+        up = _tape_core(up, sr_up, params)
+
+    # Single downsample
+    return resample_poly(up, 1, 8)[:len(buf)]
+
+
+def _transformer_core(up: np.ndarray, sr_up: int, saturation: float, mix: float) -> np.ndarray:
+    """Transformer waveshaper core (operates on already-upsampled signal)."""
+    drive = saturation * 5.0 + 0.5
+    H = up * drive
+    B = np.tanh(H / 3.0)
+    mem_coeff = 0.15 * saturation
+    if mem_coeff > 0.001:
+        b_hyst = np.array([1.0 - mem_coeff])
+        a_hyst = np.array([1.0, -mem_coeff])
+        B = lfilter(b_hyst, a_hyst, B)
+    wet = saturation * 0.6
+    result = up * (1.0 - wet) + B * wet
+    rolloff_factor = 0.02
+    fc_loss = 18000 * (1.0 - rolloff_factor * 10)
+    if fc_loss < sr_up * 0.49:
+        sos_lp = butter(1, fc_loss, btype='low', fs=sr_up, output='sos')
+        result = sosfilt(sos_lp, result)
+    return result
+
+
+def _triode_core(up: np.ndarray, sr_up: int, params: dict) -> np.ndarray:
+    """Triode Koren model core (operates on already-upsampled signal)."""
+    drive = params.get("triode_drive", 0.4)
+    bias = params.get("triode_bias", -1.2)
+    mix = params.get("triode_mix", 0.5)
+    Kp, Kvb, Ex, Vp, mu = 600.0, 300.0, 1.4, 250.0, 100.0
+    input_gain = drive * 8.0 + 0.5
+    Vg = up * input_gain + bias
+    sqrt_term = math.sqrt(Kvb + Vp * Vp)
+    inner = Kp * (1.0 / mu + Vg / sqrt_term)
+    E1 = (Vp / Kp) * np.where(inner > 20.0, inner, np.log1p(np.exp(np.clip(inner, -20, 20))))
+    Ip = np.power(np.maximum(E1, 0.0), Ex)
+    Kg = 1060.0
+    Ig = np.where(Vg > 0, np.expm1(np.clip(Vg / Kg, -20, 20)), 0.0)
+    Ip = Ip + Ig * 0.1
+    max_Ip = np.max(np.abs(Ip)) + 1e-10
+    saturated = Ip / max_Ip
+    fc_dc = 10.0
+    w_dc = 2.0 * np.pi * fc_dc / sr_up
+    b_dc = np.array([1.0, -1.0]) / (1.0 + w_dc)
+    a_dc = np.array([1.0, -(1.0 - w_dc) / (1.0 + w_dc)])
+    saturated = lfilter(b_dc, a_dc, saturated)
+    return up * (1.0 - mix) + saturated * mix
+
+
+def _tape_core(up: np.ndarray, sr_up: int, params: dict) -> np.ndarray:
+    """Tape emulation core (operates on already-upsampled signal)."""
+    saturation = params.get("tape_saturation", 0.3)
+    mix = params.get("tape_mix", 0.4)
+    bump_freq = 80.0
+    bump_gain_db = 2.0 * saturation
+    drive = saturation * 3.0 + 0.5
+    arctan_norm = np.arctan(drive)
+    compressed = np.arctan(up * drive) / arctan_norm
+    if bump_gain_db > 0.1 and bump_freq < sr_up * 0.49:
+        from rendition_dsp.services.dsp_engine_v2 import _make_peaking_sos
+        sos_bump = _make_peaking_sos(bump_freq, bump_gain_db, 0.707, sr_up)
+        compressed = sosfilt(sos_bump, compressed)
+    speed_ips = params.get("tape_speed", 30.0)
+    hf_cutoff = min(15000 + speed_ips * 200, sr_up * 0.45)
+    if hf_cutoff < sr_up * 0.49:
+        sos_hf = butter(2, hf_cutoff, btype='low', fs=sr_up, output='sos')
+        compressed = sosfilt(sos_hf, compressed)
+    return up * (1.0 - mix) + compressed * mix
+
+
 def _apply_transformer(buf: np.ndarray, sr: int, params: dict) -> np.ndarray:
     """Transformer saturation — tanh waveshaper with IIR smoothing (odd harmonics)."""
     saturation = params.get("transformer_saturation", 0.3)
@@ -542,6 +639,7 @@ def _split_4bands(buf: np.ndarray, sr: int, xovers: list) -> list:
     """
     bands = []
     remaining = buf.copy()
+    allpass_compensators = []
 
     for xover in xovers:
         if xover >= sr * 0.49:
@@ -554,8 +652,22 @@ def _split_4bands(buf: np.ndarray, sr: int, xovers: list) -> list:
         low = sosfilt(sos_lp2, sosfilt(sos_lp2, remaining))
         remaining = sosfilt(sos_hp2, sosfilt(sos_hp2, remaining))
         bands.append(low)
+        # Store allpass SOS for phase compensation of higher bands
+        allpass_compensators.append((sos_lp2, sos_hp2))
 
     bands.append(remaining)  # Highest band
+
+    # Phase compensation: each band passes through allpass filters
+    # of all crossovers below it, aligning group delay across bands
+    for band_idx in range(len(bands)):
+        for comp_idx in range(len(allpass_compensators)):
+            if comp_idx < band_idx:
+                # Apply LR4 allpass: LP(LP(x)) + HP(HP(x)) = allpass
+                sos_lp, sos_hp = allpass_compensators[comp_idx]
+                lp_path = sosfilt(sos_lp, sosfilt(sos_lp, bands[band_idx]))
+                hp_path = sosfilt(sos_hp, sosfilt(sos_hp, bands[band_idx]))
+                bands[band_idx] = lp_path + hp_path
+
     return bands
 
 
@@ -595,10 +707,11 @@ def _compress_band_stereo(
         gain_reduction_db = over_db * (1.0 - 1.0 / ratio)
         gain[over_mask] = _db_to_linear(-gain_reduction_db)
 
-    # Smoothing (anti-zipper, 2ms)
+    # Smoothing (anti-zipper, 2ms) — edge-padded to prevent head/tail gain drop
     smooth_samples = max(int(sr * 0.002), 1)
     kernel = np.ones(smooth_samples) / smooth_samples
-    gain = np.convolve(gain, kernel, mode='same')
+    padded = np.pad(gain, smooth_samples, mode='edge')
+    gain = np.convolve(padded, kernel, mode='same')[smooth_samples:-smooth_samples]
 
     return left * gain, right * gain
 
@@ -724,16 +837,18 @@ def _apply_freq_dep_width(
 # ⑫ Soft Clipper
 # ══════════════════════════════════════════
 def _soft_clipper(signal: np.ndarray, threshold: float = 0.98) -> np.ndarray:
-    """Transient-protective soft clipper with tanh shaping."""
+    """Transient-protective soft clipper with tanh shaping, 4x oversampled to prevent aliasing."""
+    # Upsample to prevent aliasing from nonlinear clipping harmonics
+    up = resample_poly(signal, 4, 1)
     slope = 0.04
-    output = signal.copy()
-    mask = np.abs(signal) > threshold
+    output = up.copy()
+    mask = np.abs(up) > threshold
     if not np.any(mask):
-        return output
-    over = np.abs(signal[mask]) - threshold
+        return resample_poly(output, 1, 4)[:len(signal)]
+    over = np.abs(up[mask]) - threshold
     clipped = threshold + slope * np.tanh(over / slope)
-    output[mask] = np.sign(signal[mask]) * clipped
-    return output
+    output[mask] = np.sign(up[mask]) * clipped
+    return resample_poly(output, 1, 4)[:len(signal)]
 
 
 # ══════════════════════════════════════════
@@ -790,8 +905,12 @@ def _apply_true_peak_limiter_stereo(
     smoothed = np.minimum(gain, lfilter(b_rel, a_rel, smoothed))
     smoothed = np.minimum(gain, lfilter(b_rel, a_rel, smoothed))
 
-    # 6. Apply same gain to both channels (stereo-linked)
-    return left * smoothed, right * smoothed
+    # 6. Delay audio by lookahead_samples to align with gain curve
+    left_delayed = np.concatenate([np.zeros(lookahead_samples), left[:-lookahead_samples]]) if lookahead_samples < n else left
+    right_delayed = np.concatenate([np.zeros(lookahead_samples), right[:-lookahead_samples]]) if lookahead_samples < n else right
+
+    # 7. Apply same gain to both channels (stereo-linked)
+    return left_delayed * smoothed, right_delayed * smoothed
 
 
 def _rolling_max(arr: np.ndarray, window: int) -> np.ndarray:
