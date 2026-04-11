@@ -24,6 +24,13 @@ from rendition_dsp.services.dsp_engine_v2 import master_audio
 FETCH_TIMEOUT = 120.0
 MAX_AUDIO_SIZE = 500 * 1024 * 1024  # 500MB
 
+# Use GCSFuse mount for temp files to avoid local memory/disk pressure.
+# Falls back to /tmp if GCSFuse mount is not available.
+_GCS_TMP = "/mnt/gcs/aimastering-tmp-audio"
+TEMP_DIR = _GCS_TMP if os.path.isdir(_GCS_TMP) else None  # None = system default /tmp
+if TEMP_DIR:
+    os.environ["TMPDIR"] = TEMP_DIR
+
 # ──────────────────────────────────────────
 # Logging
 # ──────────────────────────────────────────
@@ -93,7 +100,7 @@ async def master(
         raise HTTPException(status_code=422, detail="Invalid params JSON")
 
     # Write uploaded file directly to a temporary file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_in:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TEMP_DIR) as tmp_in:
         input_path = tmp_in.name
         while True:
             chunk = await file.read(65536)
@@ -105,10 +112,9 @@ async def master(
         os.remove(input_path)
         raise HTTPException(status_code=422, detail="Audio data too small")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_out:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TEMP_DIR) as tmp_out:
         output_path = tmp_out.name
 
-    # Run RENDITION_DSP chain via disk
     try:
         metrics = master_audio(
             input_path=input_path,
@@ -119,14 +125,15 @@ async def master(
         )
     except Exception as e:
         logger.error(f"Mastering failed: {type(e).__name__}: {e}")
-        os.remove(input_path)
-        os.remove(output_path)
+        # Cleanup output on failure (won't be served)
+        if os.path.exists(output_path):
+            os.remove(output_path)
         raise HTTPException(
             status_code=500,
-            detail=f"Mastering failed: {type(e).__name__}: {e}",
+            detail="Mastering failed. Check server logs for details.",
         )
     finally:
-        # Cleanup input file
+        # Always cleanup input file
         if os.path.exists(input_path):
             os.remove(input_path)
 
@@ -155,10 +162,10 @@ async def master_url(req: MasterUrlRequest, background_tasks: BackgroundTasks) -
     Streams audio input to disk safely, processes it, and streams it back.
     If output_url is provided, it streams the output directly to the client's storage and returns metrics.
     """
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_in:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TEMP_DIR) as tmp_in:
         input_path = tmp_in.name
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_out:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TEMP_DIR) as tmp_out:
         output_path = tmp_out.name
 
     # Stream download from URL
@@ -211,7 +218,7 @@ async def master_url(req: MasterUrlRequest, background_tasks: BackgroundTasks) -
         os.remove(output_path)
         raise HTTPException(
             status_code=500,
-            detail=f"Mastering failed: {type(e).__name__}: {e}",
+            detail="Mastering failed. Check server logs for details.",
         )
     finally:
         # Cleanup input file
