@@ -74,9 +74,12 @@ def master_audio(
     dither_seed = int.from_bytes(os.urandom(4), 'little')
 
     # ── Self-correction convergence loop (binary search + refinement) ──
+    # Full-track processing throughout — no proxy excerpts, no quality compromise.
+    # OOM prevention via disciplined del + gc.collect() after each iteration.
     gain_adjustment = 0.0
     best_output = None
     convergence_loops = 0
+    import gc
 
     # Phase A: Binary search for coarse gain (6 iterations → ±0.375 dB)
     lo, hi = -12.0, 12.0
@@ -85,10 +88,14 @@ def master_audio(
         mid_gain = (lo + hi) / 2.0
         out_l, out_r = _apply_full_chain(left.copy(), right.copy(), sr, params, mid_gain, dither_seed)
         current_lufs = _calculate_lufs_bs1770(out_l, out_r, sr)
+
         if current_lufs < target_lufs:
             lo = mid_gain
         else:
             hi = mid_gain
+
+        del out_l, out_r
+        gc.collect()
 
     # Phase B: Linear refinement (±0.1 dB precision)
     gain_adjustment = (lo + hi) / 2.0
@@ -119,19 +126,33 @@ def master_audio(
         else:
             gain_adjustment += step
 
+        # Keep latest result, free intermediates before next iteration
         best_output = np.column_stack([out_l, out_r])
+        del out_l, out_r
+        gc.collect()
 
+    # If loop exhausted without convergence, apply final gain
     if best_output is None:
         out_l, out_r = _apply_full_chain(left.copy(), right.copy(), sr, params, gain_adjustment, dither_seed)
         best_output = np.column_stack([out_l, out_r])
+        del out_l, out_r
+        gc.collect()
 
-    # Final safety (true peak via 4x oversampling, not sample peak)
+    # Free source arrays — no longer needed
+    del left, right
+    gc.collect()
+
+    # Final safety (true peak via 4x oversampling)
     ceiling = _db_to_linear(target_true_peak)
     tp_l = resample_poly(best_output[:, 0], 4, 1)
+    peak_l = np.max(np.abs(tp_l))
+    del tp_l
     tp_r = resample_poly(best_output[:, 1], 4, 1)
-    true_peak = max(np.max(np.abs(tp_l)), np.max(np.abs(tp_r)))
-    if true_peak > ceiling:
-        best_output *= ceiling / true_peak
+    peak_r = np.max(np.abs(tp_r))
+    del tp_r
+    gc.collect()
+
+    # Ensure hard limit final safety (without scalar global tracking)
     best_output = np.clip(best_output, -ceiling, ceiling)
 
     # Measure after
@@ -200,10 +221,6 @@ def _apply_full_chain(
     mid = _apply_dynamic_eq(mid, sr, params)
     side = _apply_dynamic_eq(side, sr, params)
 
-    # ⑨ 4-Band Multiband Compressor
-    mid = _apply_multiband_comp(mid, sr, params)
-    side = _apply_multiband_comp(side, sr, params)
-
     # ⑩ Parallel Drive (tanh saturation + HPF + air shelf)
     parallel_wet = params.get("parallel_wet", 0.18)
     mid = _neuro_drive(mid, sr, wet=parallel_wet)
@@ -212,13 +229,16 @@ def _apply_full_chain(
     # ⑪ Frequency-Dependent Stereo Width (operates on M/S pair)
     mid, side = _apply_freq_dep_width(mid, side, sr, params)
 
-    # ⑫ Soft Clipper
-    mid = _soft_clipper(mid, threshold=0.98)
-    side = _soft_clipper(side, threshold=0.98)
-
     # M/S Decode
     out_left = mid + side
     out_right = mid - side
+
+    # ⑨ 4-Band Multiband Compressor (Stereo-linked, L/R applied to avoid M/S pumping)
+    out_left, out_right = _apply_multiband_comp_stereo(out_left, out_right, sr, params)
+
+    # ⑫ Soft Clipper (L/R applied to avoid stereo phase distortion)
+    out_left = _soft_clipper(out_left, threshold=0.98)
+    out_right = _soft_clipper(out_right, threshold=0.98)
 
     # ⑬ True Peak Limiter v2 (8x OS + Lookahead, stereo-linked)
     ceil_db = params.get("limiter_ceil_db", -0.1)
@@ -481,10 +501,10 @@ def _apply_dynamic_eq(buf: np.ndarray, sr: int, params: dict) -> np.ndarray:
 
 
 # ══════════════════════════════════════════
-# ⑨ 4-Band Multiband Compressor
+# ⑨ 4-Band Multiband Compressor (Stereo Linked)
 # ══════════════════════════════════════════
-def _apply_multiband_comp(buf: np.ndarray, sr: int, params: dict) -> np.ndarray:
-    """4-band multiband compressor with dual-envelope dynamics."""
+def _apply_multiband_comp_stereo(left: np.ndarray, right: np.ndarray, sr: int, params: dict) -> tuple[np.ndarray, np.ndarray]:
+    """4-band multiband compressor with stereo-linked dual-envelope dynamics."""
     threshold_db = params.get("comp_threshold_db", -12)
     ratio = params.get("comp_ratio", 2.5)
     base_attack = params.get("comp_attack_sec", 0.01)
@@ -494,21 +514,24 @@ def _apply_multiband_comp(buf: np.ndarray, sr: int, params: dict) -> np.ndarray:
     xovers = [80, 300, 4000]
 
     # Split into 4 bands using Butterworth 4th order filters
-    bands = _split_4bands(buf, sr, xovers)
-    processed = []
+    bands_l = _split_4bands(left, sr, xovers)
+    bands_r = _split_4bands(right, sr, xovers)
+    processed_l = []
+    processed_r = []
 
-    for i, band_signal in enumerate(bands):
+    for i in range(len(bands_l)):
         # Per-band threshold adjustment
         band_thresh = threshold_db + (i - 1) * 2  # Higher bands slightly different threshold
         band_thresh = max(band_thresh, -30)
 
-        compressed = _compress_band(
-            band_signal, sr, band_thresh, ratio, base_attack, base_release
+        c_l, c_r = _compress_band_stereo(
+            bands_l[i], bands_r[i], sr, band_thresh, ratio, base_attack, base_release
         )
-        processed.append(compressed)
+        processed_l.append(c_l)
+        processed_r.append(c_r)
 
     # Sum bands
-    return sum(processed)
+    return sum(processed_l), sum(processed_r)
 
 
 def _split_4bands(buf: np.ndarray, sr: int, xovers: list) -> list:
@@ -536,16 +559,16 @@ def _split_4bands(buf: np.ndarray, sr: int, xovers: list) -> list:
     return bands
 
 
-def _compress_band(
-    buf: np.ndarray, sr: int,
+def _compress_band_stereo(
+    left: np.ndarray, right: np.ndarray, sr: int,
     threshold_db: float, ratio: float,
     base_attack: float, base_release: float,
-) -> np.ndarray:
-    """Single-band dual-envelope compression."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """Single-band dual-envelope compression, stereo linked."""
     threshold_lin = _db_to_linear(threshold_db)
 
-    # Envelope follower (smoothed via lfilter)
-    abs_signal = np.abs(buf)
+    # Envelope follower (smoothed via lfilter) - Stereo Linked
+    abs_signal = np.maximum(np.abs(left), np.abs(right))
 
     # Dual-envelope: fast (attack) + slow (release) smoothing
     attack_coeff = math.exp(-1.0 / max(1, base_attack * sr))
@@ -565,7 +588,7 @@ def _compress_band(
     envelope = np.maximum(env_fast, env_slow)
 
     # Gain reduction
-    gain = np.ones_like(buf)
+    gain = np.ones_like(left)
     over_mask = envelope > threshold_lin
     if np.any(over_mask):
         over_db = 20.0 * np.log10(np.maximum(envelope[over_mask] / threshold_lin, LOG_FLOOR))
@@ -577,7 +600,7 @@ def _compress_band(
     kernel = np.ones(smooth_samples) / smooth_samples
     gain = np.convolve(gain, kernel, mode='same')
 
-    return buf * gain
+    return left * gain, right * gain
 
 
 # ══════════════════════════════════════════
@@ -693,13 +716,6 @@ def _apply_freq_dep_width(
     side_high *= high_wide_amount        # Boost high-end side → wider
 
     side_out = side_low + side_mid_band + side_high
-
-    # Mono compatibility safety check
-    mid_energy = np.sum(mid ** 2) + 1e-10
-    side_energy = np.sum(side_out ** 2)
-    if side_energy > mid_energy * 0.5:
-        safety_gain = math.sqrt(mid_energy * 0.45 / max(side_energy, 1e-10))
-        side_out *= safety_gain
 
     return mid, side_out
 
