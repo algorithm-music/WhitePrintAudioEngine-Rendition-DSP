@@ -84,57 +84,108 @@ async def request_tracking_middleware(request: Request, call_next):
 # ══════════════════════════════════════════
 # Endpoints
 # ══════════════════════════════════════════
+class MasterRequest(BaseModel):
+    local_path: str = Field(..., description="Absolute path to the input audio file on the mounted volume")
+    params: dict = Field(default_factory=dict, description="DSP processing parameters")
+    target_lufs: float = Field(default=-14.0)
+    target_true_peak: float = Field(default=-1.0)
+    output_path: str | None = Field(default=None, description="Optional path to save the output. If not provided, a temp file is returned.")
+    output_url: str | None = Field(default=None, description="Optional presigned PUT URL to upload result directly to client's storage")
+
 @app.post("/internal/master")
 async def master(
+    req: MasterRequest,
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-    params: str = Form(default="{}"),
-    target_lufs: float = Form(default=-14.0),
-    target_true_peak: float = Form(default=-1.0),
-) -> FileResponse:
+) -> Response:
     """
     Core endpoint: Apply 14-stage mastering chain to audio.
-    Streams input to disk, processes, streams output from disk.
+    Reads input directly from the volume mount, processes, and writes output.
     """
-    try:
-        dsp_params = json.loads(params)
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=422, detail="Invalid params JSON")
+    input_path = req.local_path
 
-    # Stream uploaded file directly to disk (bypasses RAM)
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TEMP_DIR) as tmp_in:
-        input_path = tmp_in.name
-        shutil.copyfileobj(file.file, tmp_in)
+    if not os.path.exists(input_path):
+        raise HTTPException(status_code=404, detail="File not found on volume.")
 
     if os.path.getsize(input_path) < 100:
-        os.remove(input_path)
         raise HTTPException(status_code=422, detail="Audio data too small")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TEMP_DIR) as tmp_out:
-        output_path = tmp_out.name
+    # FUSE workaround: copy to local /tmp to avoid libsndfile SystemError on GCS FUSE mounts
+    fd, local_in = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    try:
+        import shutil
+        import asyncio
+        # We can't await inside sync if it's not setup but we are in async def master()
+        await asyncio.to_thread(shutil.copy2, input_path, local_in)
+        # Re-assign input_path to purely local file for the duration of the mastering step
+        input_path = local_in
+
+    output_path = req.output_path
+    if not output_path:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TEMP_DIR) as tmp_out:
+            output_path = tmp_out.name
 
     try:
         metrics = await asyncio.to_thread(
             master_audio,
             input_path=input_path,
             output_path=output_path,
-            params=dsp_params,
-            target_lufs=target_lufs,
-            target_true_peak=target_true_peak,
+            params=req.params,
+            target_lufs=req.target_lufs,
+            target_true_peak=req.target_true_peak,
         )
     except Exception as e:
         logger.error(f"Mastering failed: {type(e).__name__}: {e}")
-        # Cleanup output on failure (won't be served)
-        if os.path.exists(output_path):
+        if req.output_path is None and os.path.exists(output_path):
             os.remove(output_path)
         raise HTTPException(
             status_code=500,
             detail="Mastering failed. Check server logs for details.",
         )
     finally:
-        # Always cleanup input file
-        if os.path.exists(input_path):
-            os.remove(input_path)
+        if os.path.exists(local_in):
+            os.remove(local_in)
+
+    # Direct push to client storage if requested
+    if req.output_url:
+        try:
+            async def file_streamer(path):
+                with open(path, "rb") as f_out:
+                    while chunk := f_out.read(65536):
+                        yield chunk
+
+            async with httpx.AsyncClient(timeout=FETCH_TIMEOUT) as client:
+                res = await client.put(
+                    req.output_url, 
+                    content=file_streamer(output_path),
+                    headers={"Content-Type": "audio/wav"}
+                )
+                res.raise_for_status()
+                
+            logger.info("Successfully pushed mastered audio to client storage mapping.")
+            
+            if req.output_path is None and os.path.exists(output_path):
+                os.remove(output_path)
+                
+            return JSONResponse(content={
+                "status": "success",
+                "message": "Audio pushed to output_url",
+                "metrics": metrics
+            })
+            
+        except Exception as e:
+            logger.error(f"Failed to push to output_url: {e}")
+            if req.output_path is None and os.path.exists(output_path):
+                os.remove(output_path)
+            raise HTTPException(status_code=502, detail=f"Failed to push to output_url: {e}")
+
+    # If the user specified an output path, return JSON with path and metrics instead of streaming the FileResponse
+    if req.output_path:
+        return JSONResponse(content={
+            "status": "success",
+            "output_path": output_path,
+            "metrics": metrics
+        })
 
     # Cleanup output file after response is sent
     background_tasks.add_task(lambda p: os.remove(p) if os.path.exists(p) else None, output_path)
@@ -146,89 +197,6 @@ async def master(
     )
 
 
-@app.post("/internal/master-stream")
-async def master_stream(request: Request, background_tasks: BackgroundTasks) -> Response:
-    try:
-        dsp_params = json.loads(request.headers.get("X-DSP-Params", "{}"))
-        target_lufs = float(request.headers.get("X-Target-LUFS", "-14.0"))
-        target_true_peak = float(request.headers.get("X-Target-True-Peak", "-1.0"))
-        output_url = request.headers.get("X-Output-URL")
-    except ValueError:
-        raise HTTPException(status_code=422, detail="Invalid headers")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TEMP_DIR) as tmp_in:
-        input_path = tmp_in.name
-        async for chunk in request.stream():
-            tmp_in.write(chunk)
-
-    if os.path.getsize(input_path) < 100:
-        os.remove(input_path)
-        raise HTTPException(status_code=422, detail="Audio data too small")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TEMP_DIR) as tmp_out:
-        output_path = tmp_out.name
-
-    try:
-        metrics = await asyncio.to_thread(
-            master_audio,
-            input_path=input_path,
-            output_path=output_path,
-            params=dsp_params,
-            target_lufs=target_lufs,
-            target_true_peak=target_true_peak,
-        )
-    except Exception as e:
-        logger.error(f"Mastering failed: {type(e).__name__}: {e}")
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        raise HTTPException(
-            status_code=500,
-            detail="Mastering failed. Check server logs for details.",
-        )
-    finally:
-        if os.path.exists(input_path):
-            os.remove(input_path)
-
-    # Direct push to client storage if requested
-    if output_url:
-        try:
-            async def file_streamer(path):
-                with open(path, "rb") as f_out:
-                    while chunk := f_out.read(65536):
-                        yield chunk
-
-            async with httpx.AsyncClient(timeout=FETCH_TIMEOUT) as client:
-                res = await client.put(
-                    output_url, 
-                    content=file_streamer(output_path),
-                    headers={"Content-Type": "audio/wav"}
-                )
-                res.raise_for_status()
-                
-            logger.info("Successfully pushed mastered audio to client storage mapping.")
-            
-            if os.path.exists(output_path):
-                os.remove(output_path)
-                
-            return JSONResponse(content={
-                "status": "success",
-                "message": "Audio pushed to output_url",
-                "metrics": metrics
-            })
-            
-        except Exception as e:
-            logger.error(f"Failed to push to output_url: {e}")
-            if os.path.exists(output_path):
-                os.remove(output_path)
-            raise HTTPException(status_code=502, detail=f"Failed to push to output_url: {e}")
-
-    background_tasks.add_task(lambda p: os.remove(p) if os.path.exists(p) else None, output_path)
-
-    return FileResponse(
-        path=output_path,
-        media_type="audio/wav",
-        headers={"X-Metrics": json.dumps(metrics)},
-    )
 
 
 class MasterUrlRequest(BaseModel):
