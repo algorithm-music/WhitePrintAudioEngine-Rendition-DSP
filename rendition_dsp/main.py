@@ -6,8 +6,10 @@ Single responsibility: audio bytes + params in → mastered WAV bytes + metrics 
 Stateless. No file storage. No AI calls.
 """
 
+import asyncio
 import json
 import os
+import shutil
 import tempfile
 import time
 import uuid
@@ -99,14 +101,10 @@ async def master(
     except json.JSONDecodeError:
         raise HTTPException(status_code=422, detail="Invalid params JSON")
 
-    # Write uploaded file directly to a temporary file
+    # Stream uploaded file directly to disk (bypasses RAM)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TEMP_DIR) as tmp_in:
         input_path = tmp_in.name
-        while True:
-            chunk = await file.read(65536)
-            if not chunk:
-                break
-            tmp_in.write(chunk)
+        shutil.copyfileobj(file.file, tmp_in)
 
     if os.path.getsize(input_path) < 100:
         os.remove(input_path)
@@ -116,7 +114,8 @@ async def master(
         output_path = tmp_out.name
 
     try:
-        metrics = master_audio(
+        metrics = await asyncio.to_thread(
+            master_audio,
             input_path=input_path,
             output_path=output_path,
             params=dsp_params,
@@ -203,9 +202,9 @@ async def master_url(req: MasterUrlRequest, background_tasks: BackgroundTasks) -
 
     logger.info(f"Fetched {input_size / 1024 / 1024:.1f}MB from URL to local disk")
 
-    # Run RENDITION_DSP chain via disk
+    # Run RENDITION_DSP chain via disk (non-blocking)
     try:
-        metrics = master_audio(
+        metrics = await asyncio.to_thread(master_audio,
             input_path=input_path,
             output_path=output_path,
             params=req.params,
