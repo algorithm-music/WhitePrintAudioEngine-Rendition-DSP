@@ -74,88 +74,15 @@ def master_audio(
     # Per-job dither seed (unique noise per mastering run)
     dither_seed = int.from_bytes(os.urandom(4), 'little')
 
-    # ── Self-correction convergence loop (binary search + refinement) ──
-    # Full-track processing throughout — no proxy excerpts, no quality compromise.
-    # OOM prevention via disciplined del + gc.collect() after each iteration.
-    gain_adjustment = 0.0
-    best_output = None
-    convergence_loops = 0
+    # ── 1-Pass Processing (No artificial convergence loop overrides) ──
+    # Process signal strictly adhering to user intent and explicit parameters.
+    out_l, out_r = _apply_full_chain(left, right, sr, params, 0.0, dither_seed)
+    best_output = np.column_stack([out_l, out_r])
+
+    # Free source arrays
+    del left, right, out_l, out_r
     import gc
-
-    # Phase A: Binary search for coarse gain (6 iterations → ±0.375 dB)
-    lo, hi = -12.0, 12.0
-    for _ in range(6):
-        convergence_loops += 1
-        mid_gain = (lo + hi) / 2.0
-        out_l, out_r = _apply_full_chain(left.copy(), right.copy(), sr, params, mid_gain, dither_seed)
-        current_lufs = _calculate_lufs_bs1770(out_l, out_r, sr)
-
-        if current_lufs < target_lufs:
-            lo = mid_gain
-        else:
-            hi = mid_gain
-
-        del out_l, out_r
-        gc.collect()
-
-    # Phase B: Linear refinement (±0.1 dB precision)
-    gain_adjustment = (lo + hi) / 2.0
-    for _ in range(MAX_CONVERGENCE_LOOPS):
-        convergence_loops += 1
-        out_l, out_r = _apply_full_chain(left.copy(), right.copy(), sr, params, gain_adjustment, dither_seed)
-        current_lufs = _calculate_lufs_bs1770(out_l, out_r, sr)
-        current_peak = _measure_true_peak_db(out_l, out_r, sr)
-
-        lufs_diff = current_lufs - target_lufs
-        peak_safe = current_peak <= target_true_peak + 0.1
-
-        if abs(lufs_diff) < CONVERGENCE_TOLERANCE_DB and peak_safe:
-            best_output = np.column_stack([out_l, out_r])
-            logger.info(f"Converged in {convergence_loops} loops: LUFS={current_lufs:.2f}")
-            break
-
-        # Adaptive step
-        if abs(lufs_diff) > 3:
-            step = 0.5
-        elif abs(lufs_diff) > 1:
-            step = 0.2
-        else:
-            step = 0.1
-
-        if lufs_diff > 0:
-            gain_adjustment -= step
-        else:
-            gain_adjustment += step
-
-        # Keep latest result, free intermediates before next iteration
-        best_output = np.column_stack([out_l, out_r])
-        del out_l, out_r
-        gc.collect()
-
-    # If loop exhausted without convergence, apply final gain
-    if best_output is None:
-        out_l, out_r = _apply_full_chain(left.copy(), right.copy(), sr, params, gain_adjustment, dither_seed)
-        best_output = np.column_stack([out_l, out_r])
-        del out_l, out_r
-        gc.collect()
-
-    # Free source arrays — no longer needed
-    del left, right
     gc.collect()
-
-    # Final safety (true peak via 4x oversampling)
-    ceiling = _db_to_linear(target_true_peak)
-    tp_l = resample_poly(best_output[:, 0], 4, 1)
-    peak_l = np.max(np.abs(tp_l))
-    del tp_l
-    tp_r = resample_poly(best_output[:, 1], 4, 1)
-    peak_r = np.max(np.abs(tp_r))
-    del tp_r
-    gc.collect()
-
-    # NOTE: Redundant np.clip after TP Limiter removed.
-    # The TP Limiter (stage ⑬) already enforces ceiling.
-    # A second hard clip would destroy limiter-shaped transients.
 
     # Measure after
     lufs_after = _calculate_lufs_bs1770(best_output[:, 0], best_output[:, 1], sr)
@@ -238,9 +165,10 @@ def _apply_full_chain(
         out_left = _soft_clipper(out_left, threshold=clip_thresh)
         out_right = _soft_clipper(out_right, threshold=clip_thresh)
 
-    # ⑬ True Peak Limiter v2 (8x OS + Lookahead, stereo-linked)
-    ceil_db = params.get("limiter_ceil_db", -0.1)
-    out_left, out_right = _apply_true_peak_limiter_stereo(out_left, out_right, sr, ceil_db)
+    # ⑬ True Peak Limiter v2 (8x OS + Lookahead, stereo-linked) — bypassable
+    if params.get("limiter_enabled", True):
+        ceil_db = params.get("limiter_ceil_db", -0.1)
+        out_left, out_right = _apply_true_peak_limiter_stereo(out_left, out_right, sr, ceil_db)
 
     # ⑭ TPDF Dither (bypassable)
     if params.get("dither_enabled", True):
