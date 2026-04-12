@@ -66,9 +66,10 @@ def master_audio(
     lufs_before = _calculate_lufs_bs1770(left, right, sr)
     peak_before = _measure_true_peak_db(left, right, sr)
 
-    # ① DC Remove
-    left = _remove_dc(left, sr)
-    right = _remove_dc(right, sr)
+    # ① DC Remove (bypassable)
+    if params.get("dc_remove_enabled", True):
+        left = _remove_dc(left, sr)
+        right = _remove_dc(right, sr)
 
     # Per-job dither seed (unique noise per mastering run)
     dither_seed = int.from_bytes(os.urandom(4), 'little')
@@ -152,8 +153,9 @@ def master_audio(
     del tp_r
     gc.collect()
 
-    # Ensure hard limit final safety (without scalar global tracking)
-    best_output = np.clip(best_output, -ceiling, ceiling)
+    # NOTE: Redundant np.clip after TP Limiter removed.
+    # The TP Limiter (stage ⑬) already enforces ceiling.
+    # A second hard clip would destroy limiter-shaped transients.
 
     # Measure after
     lufs_after = _calculate_lufs_bs1770(best_output[:, 0], best_output[:, 1], sr)
@@ -221,24 +223,30 @@ def _apply_full_chain(
     out_right = mid - side
 
     # ⑩ Parallel Drive (L/R space — avoids M/S harmonic scatter)
-    parallel_wet = params.get("parallel_wet", 0.18)
-    out_left = _neuro_drive(out_left, sr, wet=parallel_wet)
-    out_right = _neuro_drive(out_right, sr, wet=parallel_wet)
+    parallel_wet = params.get("parallel_wet", 0.0)  # Default OFF
+    parallel_drive = params.get("parallel_drive", 3.0)
+    out_left = _neuro_drive(out_left, sr, wet=parallel_wet, drive=parallel_drive)
+    out_right = _neuro_drive(out_right, sr, wet=parallel_wet, drive=parallel_drive)
 
     # ⑨ 4-Band Multiband Compressor (Stereo-linked, L/R)
     out_left, out_right = _apply_multiband_comp_stereo(out_left, out_right, sr, params)
 
     # ⑫ Soft Clipper (L/R applied to avoid stereo phase distortion)
-    out_left = _soft_clipper(out_left, threshold=0.98)
-    out_right = _soft_clipper(out_right, threshold=0.98)
+    # Artist override: bypass when soft_clip_enabled=0 (default=1)
+    if params.get("soft_clip_enabled", 1):
+        clip_thresh = params.get("soft_clip_threshold", 0.98)
+        out_left = _soft_clipper(out_left, threshold=clip_thresh)
+        out_right = _soft_clipper(out_right, threshold=clip_thresh)
 
     # ⑬ True Peak Limiter v2 (8x OS + Lookahead, stereo-linked)
     ceil_db = params.get("limiter_ceil_db", -0.1)
     out_left, out_right = _apply_true_peak_limiter_stereo(out_left, out_right, sr, ceil_db)
 
-    # ⑭ TPDF Dither
-    out_left = _apply_dither(out_left, target_bits=24, channel_idx=0, seed=dither_seed)
-    out_right = _apply_dither(out_right, target_bits=24, channel_idx=1, seed=dither_seed)
+    # ⑭ TPDF Dither (bypassable)
+    if params.get("dither_enabled", True):
+        dither_bits = params.get("dither_bits", 24)
+        out_left = _apply_dither(out_left, target_bits=dither_bits, channel_idx=0, seed=dither_seed)
+        out_right = _apply_dither(out_right, target_bits=dither_bits, channel_idx=1, seed=dither_seed)
 
     return out_left, out_right
 
@@ -312,8 +320,7 @@ def _transformer_core(up: np.ndarray, sr_up: int, saturation: float, mix: float)
         b_hyst = np.array([1.0 - mem_coeff])
         a_hyst = np.array([1.0, -mem_coeff])
         B = lfilter(b_hyst, a_hyst, B)
-    wet = saturation * 0.6
-    result = up * (1.0 - wet) + B * wet
+    result = up * (1.0 - mix) + B * mix
     rolloff_factor = 0.02
     fc_loss = 18000 * (1.0 - rolloff_factor * 10)
     if fc_loss < sr_up * 0.49:
@@ -391,8 +398,8 @@ def _apply_transformer(buf: np.ndarray, sr: int, params: dict) -> np.ndarray:
         a_hyst = np.array([1.0, -mem_coeff])
         B = lfilter(b_hyst, a_hyst, B)
 
-    # Wet/dry blend
-    wet = saturation * 0.6
+    # Wet/dry blend — use the artist-specified transformer_mix
+    wet = mix
     result = up * (1.0 - wet) + B * wet
 
     # HF rolloff (gentle anti-aliasing)
@@ -526,20 +533,13 @@ def _apply_tape(buf: np.ndarray, sr: int, params: dict) -> np.ndarray:
 # ══════════════════════════════════════════
 def _apply_dynamic_eq(buf: np.ndarray, sr: int, params: dict) -> np.ndarray:
     """Frequency-selective dynamic processing."""
-    if not params.get("dyn_eq_enabled", True):
+    if not params.get("dyn_eq_enabled", False):  # Default OFF — artist must opt-in
         return buf
 
-    # Default bands: Low Tame, Mud Cut, De-Harsh, Air Boost
-    default_bands = [
-        {"freq": 80, "q": 0.8, "threshold_db": -12, "max_gain_db": -3,
-         "attack_ms": 20.0, "release_ms": 150.0},
-        {"freq": 300, "q": 1.0, "threshold_db": -15, "max_gain_db": -2,
-         "attack_ms": 15.0, "release_ms": 120.0},
-        {"freq": 5000, "q": 1.2, "threshold_db": -18, "max_gain_db": -4,
-         "attack_ms": 10.0, "release_ms": 80.0},
-        {"freq": 12000, "q": 0.8, "threshold_db": -25, "max_gain_db": 2,
-         "attack_ms": 5.0, "release_ms": 60.0},
-    ]
+    # Dynamic EQ bands — NO hardcoded defaults.
+    # If the artist/AI did not specify bands, Dynamic EQ is a no-op.
+    # This prevents unauthorized tonal changes.
+    default_bands = []
     bands = params.get("dyn_eq_bands", default_bands)
     result = buf.copy()
 
@@ -617,9 +617,9 @@ def _apply_multiband_comp_stereo(left: np.ndarray, right: np.ndarray, sr: int, p
     processed_r = []
 
     for i in range(len(bands_l)):
-        # Per-band threshold adjustment
-        band_thresh = threshold_db + (i - 1) * 2  # Higher bands slightly different threshold
-        band_thresh = max(band_thresh, -30)
+        # Threshold is applied as specified — no hidden per-band offset.
+        # The artist's comp_threshold_db is respected exactly.
+        band_thresh = threshold_db
 
         c_l, c_r = _compress_band_stereo(
             bands_l[i], bands_r[i], sr, band_thresh, ratio, base_attack, base_release
@@ -729,16 +729,17 @@ def _apply_parametric_eq(buf: np.ndarray, sr: int, params: dict, ch_type: str) -
         {"type": "highshelf", "freq": 8000, "gain_db": params.get("eq_high_shelf_gain_db", 0)},
     ]
 
-    # M/S specific adjustments
+    # M/S specific adjustments — artist-specified values applied at full
+    # strength. No hidden 0.5x multiplier.
     if ch_type == "side":
         side_high = params.get("ms_side_high_gain_db", 0)
         eq_config.append(
-            {"type": "highshelf", "freq": 4000, "gain_db": side_high * 0.5}
+            {"type": "highshelf", "freq": 4000, "gain_db": side_high}
         )
     else:
         mid_low = params.get("ms_mid_low_gain_db", 0)
         eq_config.append(
-            {"type": "lowshelf", "freq": 200, "gain_db": mid_low * 0.5}
+            {"type": "lowshelf", "freq": 200, "gain_db": mid_low}
         )
 
     result = buf.copy()
@@ -924,23 +925,15 @@ def _rolling_max(arr: np.ndarray, window: int) -> np.ndarray:
 # ══════════════════════════════════════════
 # ⑩ Parallel Drive (Enhanced Neuro-Drive)
 # ══════════════════════════════════════════
-def _neuro_drive(buf: np.ndarray, sr: int, wet: float = 0.18) -> np.ndarray:
-    """Parallel saturation (tanh waveshaper) + HPF + high shelf for energy."""
+def _neuro_drive(buf: np.ndarray, sr: int, wet: float = 0.18, drive: float = 3.0) -> np.ndarray:
+    """Parallel saturation (tanh waveshaper).
+
+    Pure saturation only — no hidden EQ shaping.
+    """
     if wet < 0.01:
         return buf
 
-    # tanh saturation (not compression — no threshold/ratio/envelope)
-    compressed = np.tanh(buf * 3.0) * 0.5
-
-    # HPF at 80 Hz on compressed signal (remove mud)
-    if sr > 200:
-        sos_hpf = butter(2, 80, btype='high', fs=sr, output='sos')
-        compressed = sosfilt(sos_hpf, compressed)
-
-    # High shelf boost at 8kHz for air
-    sos_air = _make_eq_sos({"type": "highshelf", "freq": 8000, "gain_db": 2.0, "q": 0.707}, sr)
-    if sos_air is not None and 8000 < sr * 0.49:
-        compressed = sosfilt(sos_air, compressed)
+    compressed = np.tanh(buf * drive) * 0.5
 
     return buf * (1.0 - wet) + compressed * wet
 
