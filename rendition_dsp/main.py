@@ -113,12 +113,13 @@ async def master(
     fd, local_in = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
     try:
-        import shutil
-        import asyncio
-        # We can't await inside sync if it's not setup but we are in async def master()
         await asyncio.to_thread(shutil.copy2, input_path, local_in)
         # Re-assign input_path to purely local file for the duration of the mastering step
         input_path = local_in
+    except Exception as copy_err:
+        if os.path.exists(local_in):
+            os.remove(local_in)
+        raise HTTPException(status_code=500, detail=f"Failed to copy input file: {copy_err}")
 
     output_path = req.output_path
     if not output_path:
