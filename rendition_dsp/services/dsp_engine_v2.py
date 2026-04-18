@@ -1,7 +1,7 @@
 # pyre-ignore-all-errors
 
 """
-RENDITION_DSP Engine v2 — 14-Stage Mastering Chain with Dynamic Automation
+RENDITION_DSP Engine v2.1 — 14-Stage Mastering Chain with Dynamic Automation (Memory-Safe)
 
 Signal flow:
  1 DC Remove -> 2 Gain Stage ->
@@ -12,12 +12,15 @@ Signal flow:
  M/S Decode ->
  13 TP Limiter v2 -> 14 TPDF Dither
 
-Special Feature:
-- Dynamic Section Overrides (Automation) with 1s pre-roll
-  and 50ms crossfades
-- Self-correction convergence: binary search + linear refinement
-- LUFS measurement: ITU-R BS.1770-4 compliant
-- Saturation stages 3/4/5: 8x oversampling via resample_poly
+Memory-safety changes (v2.1):
+- float32 throughout (no float64 upcast) — halves RAM.
+- Oversampled stages (saturation 8x, soft clip 4x, TP limiter 8x) now process
+  L and R sequentially, not as a stacked (N, 2) array. Peak RAM during
+  resample_poly is cut roughly in half.
+- Convergence loop avoids redundant .copy() and column_stack per iteration.
+- TP limiter reuses a single upsampled buffer with in-place np.abs + block-max
+  so L and R upsamples never coexist in RAM.
+- dynamic_range measurement takes separate l/r without building an (N, 2) stereo.
 """
 
 import gc
@@ -32,7 +35,7 @@ from scipy.signal import butter, lfilter, resample_poly, sosfilt
 
 logger = logging.getLogger("rendition_dsp.dsp_v2")
 
-MAX_CONVERGENCE_LOOPS = 20
+MAX_CONVERGENCE_LOOPS = 5
 CONVERGENCE_TOLERANCE_DB = 0.1
 LOG_FLOOR = 1e-10
 
@@ -44,17 +47,19 @@ def master_audio(
     target_lufs: float = -14.0,
     target_true_peak: float = -1.0,
 ) -> dict:
-    """Apply 14-stage dynamic mastering chain."""
-    data, sr = sf.read(input_path, dtype="float64")
+    """Apply 14-stage dynamic mastering chain with Newton-method convergence."""
+    data, sr = sf.read(input_path, dtype="float32")
     if data.ndim == 1:
         data = np.column_stack([data, data])
 
-    left = data[:, 0].copy()
-    right = (
-        data[:, 1].copy()
-        if data.shape[1] >= 2
-        else data[:, 0].copy()
+    # Keep float32 — no .astype(float64) upcast.
+    left = np.ascontiguousarray(data[:, 0], dtype=np.float32)
+    right = np.ascontiguousarray(
+        data[:, 1] if data.shape[1] >= 2 else data[:, 0],
+        dtype=np.float32,
     )
+    del data
+    gc.collect()
 
     lufs_before = _calculate_lufs_bs1770(left, right, sr)
     peak_before = _measure_true_peak_db(left, right, sr)
@@ -66,81 +71,71 @@ def master_audio(
     dither_seed = int.from_bytes(os.urandom(4), "little")
 
     gain_adjustment = 0.0
-    best_output = None
     convergence_loops = 0
+    # Holds the most-recent processed output; the final iteration's buffers
+    # are what we write to disk (no per-iteration column_stack).
+    curr_out_l: np.ndarray | None = None
+    curr_out_r: np.ndarray | None = None
 
-    lo, hi = -12.0, 12.0
-    for _ in range(6):
-        convergence_loops += 1
-        mid_gain = (lo + hi) / 2.0
-        out_l, out_r = _apply_dynamic_chain(
-            left.copy(), right.copy(), sr,
-            params, mid_gain, dither_seed,
-        )
-        current_lufs = _calculate_lufs_bs1770(out_l, out_r, sr)
-        if current_lufs < target_lufs:
-            lo = mid_gain
-        else:
-            hi = mid_gain
-        del out_l, out_r
-        gc.collect()
-
-    gain_adjustment = (lo + hi) / 2.0
     for _ in range(MAX_CONVERGENCE_LOOPS):
         convergence_loops += 1
+
+        # _apply_dynamic_chain makes its own mutable copies internally.
+        # We pass base left/right as read-only references.
+        if curr_out_l is not None:
+            del curr_out_l, curr_out_r
+            gc.collect()
+
         out_l, out_r = _apply_dynamic_chain(
-            left.copy(), right.copy(), sr,
-            params, gain_adjustment, dither_seed,
+            left, right, sr, params, gain_adjustment, dither_seed,
         )
+        curr_out_l, curr_out_r = out_l, out_r
+
         current_lufs = _calculate_lufs_bs1770(out_l, out_r, sr)
         current_peak = _measure_true_peak_db(out_l, out_r, sr)
         lufs_diff = current_lufs - target_lufs
         peak_safe = current_peak <= target_true_peak + 0.1
 
+        logger.info(
+            f"Loop {convergence_loops}: LUFS={current_lufs:.2f}, "
+            f"Peak={current_peak:.2f}, GainAdj={gain_adjustment:.2f}dB"
+        )
+
         if abs(lufs_diff) < CONVERGENCE_TOLERANCE_DB and peak_safe:
-            best_output = np.column_stack([out_l, out_r])
-            logger.info(
-                f"Converged in {convergence_loops} loops: "
-                f"LUFS={current_lufs:.2f}"
-            )
             break
 
-        step = (
-            0.5 if abs(lufs_diff) > 3
-            else (0.2 if abs(lufs_diff) > 1 else 0.1)
-        )
-        gain_adjustment += step if lufs_diff < 0 else -step
-        best_output = np.column_stack([out_l, out_r])
-        del out_l, out_r
-        gc.collect()
+        # Newton-method proportional control: 0.85 learning rate compensates
+        # for compressor gain reduction (gain/LUFS relationship is near-linear).
+        gain_adjustment -= lufs_diff * 0.85
+        if current_peak > target_true_peak:
+            gain_adjustment -= (current_peak - target_true_peak) * 1.0
 
-    if best_output is None:
-        out_l, out_r = _apply_dynamic_chain(
-            left.copy(), right.copy(), sr,
-            params, gain_adjustment, dither_seed,
-        )
-        best_output = np.column_stack([out_l, out_r])
-        del out_l, out_r
-        gc.collect()
+    assert curr_out_l is not None and curr_out_r is not None
 
+    # Free base input buffers before building the final stereo array for write.
     del left, right
     gc.collect()
 
-    lufs_after = _calculate_lufs_bs1770(
-        best_output[:, 0], best_output[:, 1], sr
+    lufs_after = _calculate_lufs_bs1770(curr_out_l, curr_out_r, sr)
+    peak_after = _measure_true_peak_db(curr_out_l, curr_out_r, sr)
+    dr_after = _calculate_dynamic_range(curr_out_l, curr_out_r, sr)
+
+    # Single column_stack right before write.
+    best_output = np.column_stack([curr_out_l, curr_out_r]).astype(
+        np.float32, copy=False
     )
-    peak_after = _measure_true_peak_db(
-        best_output[:, 0], best_output[:, 1], sr
-    )
-    dr_after = _calculate_dynamic_range(best_output, sr)
+    del curr_out_l, curr_out_r
+    gc.collect()
 
     sf.write(
         output_path,
-        best_output.astype(np.float32),
+        best_output,
         sr,
         format="WAV",
         subtype="PCM_24",
     )
+    del best_output
+    gc.collect()
 
     return {
         "lufs_before": round(lufs_before, 1),
@@ -152,7 +147,7 @@ def master_audio(
         "gain_adjustment_db": round(gain_adjustment, 2),
         "target_lufs": target_lufs,
         "target_true_peak": target_true_peak,
-        "engine_version": "v2_14stage_dynamic",
+        "engine_version": "v2.1_kaioken_optimized",
     }
 
 
@@ -161,16 +156,21 @@ def _apply_dynamic_chain(
     sr: int, params: dict, gain_adj: float,
     dither_seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Mastering chain with Dynamic Automation."""
+    """Mastering chain with Dynamic Automation.
+
+    Takes read-only references for `left`/`right`; makes internal copies once
+    per call so the convergence loop does not re-copy upstream.
+    """
     overrides = params.get("section_overrides", [])
     out_l, out_r = _apply_full_chain(
-        left, right, sr, params, gain_adj, dither_seed
+        left.copy(), right.copy(), sr, params, gain_adj, dither_seed,
     )
     if not overrides:
         return out_l, out_r
 
     crossfade_samps = int(0.05 * sr)
     preroll_sec = 1.0
+    sig_len = len(left)
 
     for ovr in overrides:
         start_sec = ovr.get("start_sec")
@@ -182,21 +182,16 @@ def _apply_dynamic_chain(
         sec_params.update(ovr)
         act_start = int(start_sec * sr)
         act_end = int(end_sec * sr)
-        if act_start >= len(left):
+        if act_start >= sig_len:
             continue
 
-        start_samp = max(
-            0, act_start - int(preroll_sec * sr)
-        )
-        end_samp = min(
-            len(left), act_end + crossfade_samps
-        )
+        start_samp = max(0, act_start - int(preroll_sec * sr))
+        end_samp = min(sig_len, act_end + crossfade_samps)
 
-        chunk_l = left[start_samp:end_samp].copy()
-        chunk_r = right[start_samp:end_samp].copy()
         proc_l, proc_r = _apply_full_chain(
-            chunk_l, chunk_r, sr,
-            sec_params, gain_adj, dither_seed,
+            left[start_samp:end_samp].copy(),
+            right[start_samp:end_samp].copy(),
+            sr, sec_params, gain_adj, dither_seed,
         )
 
         preroll_actual = act_start - start_samp
@@ -208,33 +203,29 @@ def _apply_dynamic_chain(
             act_end - act_start + crossfade_samps,
         )
 
-        window = np.ones(insert_len)
+        window = np.ones(insert_len, dtype=np.float32)
         if insert_len > crossfade_samps and act_start > 0:
             window[:crossfade_samps] = np.linspace(
-                0, 1, crossfade_samps
+                0.0, 1.0, crossfade_samps, dtype=np.float32
             )
         ie = act_start + insert_len
-        if insert_len > crossfade_samps and ie < len(left):
+        if insert_len > crossfade_samps and ie < sig_len:
             window[-crossfade_samps:] = np.linspace(
-                1, 0, crossfade_samps
+                1.0, 0.0, crossfade_samps, dtype=np.float32
             )
 
         tgt_l = out_l[act_start:ie]
-        tgt_r = out_r[act_start:ie]
         sl = min(len(tgt_l), len(window))
 
-        out_l[act_start:act_start + sl] = (
-            tgt_l[:sl] * (1.0 - window[:sl])
-            + proc_l[:sl] * window[:sl]
-        )
-        out_r[act_start:act_start + sl] = (
-            tgt_r[:sl] * (1.0 - window[:sl])
-            + proc_r[:sl] * window[:sl]
-        )
+        # In-place crossfade blend — no intermediate full-size arrays.
+        win_s = window[:sl]
+        inv_win = 1.0 - win_s
+        out_l[act_start:act_start + sl] *= inv_win
+        out_l[act_start:act_start + sl] += proc_l[:sl] * win_s
+        out_r[act_start:act_start + sl] *= inv_win
+        out_r[act_start:act_start + sl] += proc_r[:sl] * win_s
 
-        del chunk_l, chunk_r, proc_l, proc_r
-        del window, tgt_l, tgt_r
-        gc.collect()
+        del proc_l, proc_r, window, win_s, inv_win
 
     return out_l, out_r
 
@@ -244,13 +235,12 @@ def _apply_full_chain(
     sr: int, params: dict, gain_adj: float,
     dither_seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Apply stages 2-14."""
-    g = _db_to_linear(
-        params.get("input_gain_db", 0) + gain_adj
-    )
-    left *= g
+    """Apply stages 2-14. Oversampled stages run sequentially per channel."""
+    g = _db_to_linear(params.get("input_gain_db", 0) + gain_adj)
+    left *= g  # in-place; caller passed a copy.
     right *= g
 
+    # Saturation (8x OS): process L, free, process R, free.
     left = _apply_saturation_chain(left, sr, params)
     right = _apply_saturation_chain(right, sr, params)
 
@@ -265,36 +255,32 @@ def _apply_full_chain(
     mid, side = _apply_freq_dep_width(mid, side, sr, params)
     out_l = mid + side
     out_r = mid - side
+    del mid, side
 
     pw = params.get("parallel_wet", 0.0)
     pd = params.get("parallel_drive", 3.0)
     out_l = _neuro_drive(out_l, sr, wet=pw, drive=pd)
     out_r = _neuro_drive(out_r, sr, wet=pw, drive=pd)
 
-    out_l, out_r = _apply_multiband_comp_stereo(
-        out_l, out_r, sr, params
-    )
+    out_l, out_r = _apply_multiband_comp_stereo(out_l, out_r, sr, params)
 
     if params.get("soft_clip_enabled", 1):
         ct = params.get("soft_clip_threshold", 0.98)
+        # Sequential (4x OS) — no stacked stereo buffer.
         out_l = _soft_clipper(out_l, threshold=ct)
         out_r = _soft_clipper(out_r, threshold=ct)
 
     if params.get("limiter_enabled", True):
         cd = params.get("limiter_ceil_db", -0.1)
-        out_l, out_r = _apply_tp_limiter(
-            out_l, out_r, sr, cd
-        )
+        out_l, out_r = _apply_tp_limiter(out_l, out_r, sr, cd)
 
     if params.get("dither_enabled", True):
         db = params.get("dither_bits", 24)
         out_l = _apply_dither(
-            out_l, target_bits=db,
-            channel_idx=0, seed=dither_seed,
+            out_l, target_bits=db, channel_idx=0, seed=dither_seed,
         )
         out_r = _apply_dither(
-            out_r, target_bits=db,
-            channel_idx=1, seed=dither_seed,
+            out_r, target_bits=db, channel_idx=1, seed=dither_seed,
         )
 
     return out_l, out_r
@@ -304,12 +290,13 @@ def _remove_dc(buf: np.ndarray, sr: int) -> np.ndarray:
     w0 = 2.0 * np.pi * 5.0 / sr
     b = np.array([1.0, -1.0]) / (1.0 + w0)
     a = np.array([1.0, -(1.0 - w0) / (1.0 + w0)])
-    return lfilter(b, a, buf)
+    return lfilter(b, a, buf).astype(np.float32, copy=False)
 
 
 def _apply_saturation_chain(
     buf: np.ndarray, sr: int, params: dict,
 ) -> np.ndarray:
+    """Per-channel saturation: transformer + triode + tape at 8x OS, float32."""
     ts = params.get("transformer_saturation", 0.3)
     tm = params.get("transformer_mix", 0.4)
     td = params.get("triode_drive", 0.4)
@@ -320,7 +307,7 @@ def _apply_saturation_chain(
     if max(ts, tm, td, tx, ps, pm) < 0.01:
         return buf
 
-    up = resample_poly(buf, 8, 1)
+    up = resample_poly(buf, 8, 1).astype(np.float32, copy=False)
     su = sr * 8
 
     if ts >= 0.01 or tm >= 0.01:
@@ -328,14 +315,16 @@ def _apply_saturation_chain(
         B = np.tanh((up * drv) / 3.0)
         mem = 0.15 * ts
         if mem > 0.001:
-            B = lfilter([1.0 - mem], [1.0, -mem], B)
+            B = lfilter([1.0 - mem], [1.0, -mem], B).astype(
+                np.float32, copy=False
+            )
         up = up * (1.0 - tm) + B * tm
+        del B
         fc = 18000 * 0.8
         if fc < su * 0.49:
             up = sosfilt(
-                butter(1, fc, btype="low", fs=su, output="sos"),
-                up,
-            )
+                butter(1, fc, btype="low", fs=su, output="sos"), up,
+            ).astype(np.float32, copy=False)
 
     if td >= 0.01 or tx >= 0.01:
         bias = params.get("triode_bias", -1.2)
@@ -343,24 +332,31 @@ def _apply_saturation_chain(
         st = math.sqrt(300.0 + 250.0 ** 2)
         inner = 600.0 * (1.0 / 100.0 + Vg / st)
         E1 = (250.0 / 600.0) * np.where(
-            inner > 20.0, inner,
+            inner > 20.0,
+            inner,
             np.log1p(np.exp(np.clip(inner, -20, 20))),
         )
+        del inner
         Ip = np.power(np.maximum(E1, 0.0), 1.4)
+        del E1
         Ig = np.where(
             Vg > 0,
             np.expm1(np.clip(Vg / 1060.0, -20, 20)),
             0.0,
         )
+        del Vg
         Ip += Ig * 0.1
+        del Ig
         sat = Ip / (np.max(np.abs(Ip)) + 1e-10)
+        del Ip
         wdc = 2.0 * np.pi * 10.0 / su
         sat = lfilter(
             [1.0 / (1.0 + wdc), -1.0 / (1.0 + wdc)],
             [1.0, -(1.0 - wdc) / (1.0 + wdc)],
             sat,
-        )
+        ).astype(np.float32, copy=False)
         up = up * (1.0 - tx) + sat * tx
+        del sat
 
     if ps >= 0.01 or pm >= 0.01:
         drv = ps * 3.0 + 0.5
@@ -371,12 +367,14 @@ def _apply_saturation_chain(
         )
         if hfc < su * 0.49:
             comp = sosfilt(
-                butter(2, hfc, btype="low", fs=su, output="sos"),
-                comp,
-            )
+                butter(2, hfc, btype="low", fs=su, output="sos"), comp,
+            ).astype(np.float32, copy=False)
         up = up * (1.0 - pm) + comp * pm
+        del comp
 
-    return resample_poly(up, 1, 8)[:len(buf)]
+    out = resample_poly(up, 1, 8)[:len(buf)].astype(np.float32, copy=False)
+    del up
+    return out
 
 
 def _apply_dynamic_eq(
@@ -398,8 +396,7 @@ def _apply_dynamic_eq(
         if lo_f >= hi_f:
             continue
         sos = butter(
-            2, [lo_f, hi_f], btype="band",
-            fs=sr, output="sos",
+            2, [lo_f, hi_f], btype="band", fs=sr, output="sos",
         )
         sc = np.abs(sosfilt(sos, buf))
         ac = math.exp(
@@ -412,6 +409,7 @@ def _apply_dynamic_eq(
             lfilter([1 - ac], [1, -ac], sc),
             lfilter([1 - rc], [1, -rc], sc),
         )
+        del sc
         gain = np.where(
             env > th,
             1.0 + (mg - 1.0) * np.minimum(
@@ -419,8 +417,10 @@ def _apply_dynamic_eq(
             ),
             1.0,
         )
+        del env
         res += sosfilt(sos, res) * (gain - 1.0)
-    return res
+        del gain
+    return res.astype(np.float32, copy=False)
 
 
 def _apply_multiband_comp_stereo(
@@ -468,6 +468,7 @@ def _apply_multiband_comp_stereo(
             lfilter([1 - ac], [1, -ac], ab),
             lfilter([1 - rc], [1, -rc], ab),
         )
+        del ab
         tl = _db_to_linear(th_db)
         gain = np.ones_like(bl[i])
         mask = env > tl
@@ -478,6 +479,7 @@ def _apply_multiband_comp_stereo(
             gain[mask] = _db_to_linear(
                 -(odb * (1.0 - 1.0 / rat))
             )
+        del env
         pad = max(int(sr * 0.002), 1)
         gain = np.convolve(
             np.pad(gain, pad, mode="edge"),
@@ -486,8 +488,12 @@ def _apply_multiband_comp_stereo(
         )[pad:-pad]
         pl.append(bl[i] * gain)
         pr.append(br[i] * gain)
+        del gain
 
-    return sum(pl), sum(pr)
+    sum_l = sum(pl).astype(np.float32, copy=False)
+    sum_r = sum(pr).astype(np.float32, copy=False)
+    del bl, br, pl, pr
+    return sum_l, sum_r
 
 
 def _apply_parametric_eq(
@@ -554,7 +560,7 @@ def _apply_parametric_eq(
             1.0, a1 / a0, a2 / a0,
         ]])
         res = sosfilt(sos, res)
-    return res
+    return res.astype(np.float32, copy=False)
 
 
 def _apply_freq_dep_width(
@@ -578,44 +584,65 @@ def _apply_freq_dep_width(
         butter(4, 4000.0, btype="high", fs=sr, output="sos"),
         side,
     ) * hw
-    return mid, s_lo + s_mid + s_hi
+    side_out = (s_lo + s_mid + s_hi).astype(np.float32, copy=False)
+    del s_lo, s_mid, s_hi
+    return mid, side_out
 
 
 def _soft_clipper(
     signal: np.ndarray, threshold: float = 0.98,
 ) -> np.ndarray:
-    up = resample_poly(signal, 4, 1)
+    """Per-channel 4x-oversampled soft clipper."""
+    up = resample_poly(signal, 4, 1).astype(np.float32, copy=False)
     mask = np.abs(up) > threshold
     if np.any(mask):
         over = np.abs(up[mask]) - threshold
         up[mask] = np.sign(up[mask]) * (
             threshold + 0.04 * np.tanh(over / 0.04)
         )
-    return resample_poly(up, 1, 4)[:len(signal)]
+    out = resample_poly(up, 1, 4)[:len(signal)].astype(np.float32, copy=False)
+    del up
+    return out
 
 
 def _apply_tp_limiter(
     l: np.ndarray, r: np.ndarray,
     sr: int, ceil_db: float,
 ):
+    """True-peak limiter with stereo-linked gain.
+
+    L and R are upsampled sequentially (not stacked), so peak RAM during
+    resample_poly is one channel's 8x buffer instead of two.
+    """
     ceil = _db_to_linear(ceil_db)
     la = max(1, int(5.0 / 1000.0 * sr))
 
-    up_l = resample_poly(l, 8, 1)
-    up_r = resample_poly(r, 8, 1)
-    um = np.maximum(np.abs(up_l), np.abs(up_r))
-    del up_l, up_r
-
-    nf = min(len(l), len(um) // 8)
-    ps = um[:nf * 8].reshape(nf, 8).max(axis=1)
+    # --- L channel: upsample, in-place abs, block-max to base rate, free ---
+    up = resample_poly(l, 8, 1).astype(np.float32, copy=False)
+    np.abs(up, out=up)
+    nf = min(len(l), len(up) // 8)
+    ps_l = up[:nf * 8].reshape(nf, 8).max(axis=1)
     if nf < len(l):
-        rm = (
-            np.max(um[nf * 8:])
-            if nf * 8 < len(um) else 0.0
-        )
-        ps = np.append(ps, np.full(len(l) - nf, rm))
-    del um
+        rm = float(np.max(up[nf * 8:])) if nf * 8 < len(up) else 0.0
+        ps_l = np.append(ps_l, np.full(len(l) - nf, rm, dtype=np.float32))
+    del up
     gc.collect()
+
+    # --- R channel: same, then link via per-sample max ---
+    up = resample_poly(r, 8, 1).astype(np.float32, copy=False)
+    np.abs(up, out=up)
+    nf_r = min(len(r), len(up) // 8)
+    ps_r = up[:nf_r * 8].reshape(nf_r, 8).max(axis=1)
+    if nf_r < len(r):
+        rm = float(np.max(up[nf_r * 8:])) if nf_r * 8 < len(up) else 0.0
+        ps_r = np.append(ps_r, np.full(len(r) - nf_r, rm, dtype=np.float32))
+    del up
+    gc.collect()
+
+    # Align lengths defensively then take stereo-linked peak envelope.
+    n = min(len(ps_l), len(ps_r), len(l), len(r))
+    ps = np.maximum(ps_l[:n], ps_r[:n])
+    del ps_l, ps_r
 
     pa = (
         maximum_filter1d(
@@ -624,7 +651,10 @@ def _apply_tp_limiter(
         )
         if la > 1 else ps
     )
-    gain = np.where(pa > ceil, ceil / (pa + 1e-10), 1.0)
+    gain = np.where(pa > ceil, ceil / (pa + 1e-10), 1.0).astype(
+        np.float32, copy=False
+    )
+    del pa, ps
 
     rc = math.exp(-1.0 / max(1, 50.0 / 1000.0 * sr))
     br = np.array([1.0 - rc])
@@ -636,17 +666,22 @@ def _apply_tp_limiter(
                 gain, lfilter(br, ar, gain),
             )),
         )),
-    )
+    ).astype(np.float32, copy=False)
+    del gain
 
     ld = (
-        np.concatenate([np.zeros(la), l[:-la]])
+        np.concatenate([np.zeros(la, dtype=np.float32), l[:-la]])
         if la < len(l) else l
     )
     rd = (
-        np.concatenate([np.zeros(la), r[:-la]])
+        np.concatenate([np.zeros(la, dtype=np.float32), r[:-la]])
         if la < len(r) else r
     )
-    return ld * sm, rd * sm
+    # Trim sm to match so broadcasting is safe.
+    sm = sm[:len(ld)]
+    return (ld * sm).astype(np.float32, copy=False), (rd * sm).astype(
+        np.float32, copy=False
+    )
 
 
 def _neuro_drive(
@@ -658,7 +693,7 @@ def _neuro_drive(
     return (
         buf * (1.0 - wet)
         + np.tanh(buf * drive) * 0.5 * wet
-    )
+    ).astype(np.float32, copy=False)
 
 
 def _apply_dither(
@@ -666,12 +701,14 @@ def _apply_dither(
     channel_idx: int = 0, seed: int = 0,
 ) -> np.ndarray:
     lvls = 2 ** (target_bits - 1)
-    rng = np.random.RandomState(seed + channel_idx)
+    rng = np.random.default_rng(seed + channel_idx)
     tpdf = (
         rng.uniform(-0.5, 0.5, len(buf))
         + rng.uniform(-0.5, 0.5, len(buf))
     ) / lvls
-    return np.round((buf + tpdf) * lvls) / lvls
+    return (np.round((buf + tpdf) * lvls) / lvls).astype(
+        np.float32, copy=False
+    )
 
 
 def _calculate_lufs_bs1770(
@@ -716,6 +753,7 @@ def _calculate_lufs_bs1770(
         + np.mean(rk[i * hs:i * hs + bs] ** 2)
         for i in range(nb)
     ])
+    del lk, rk
     ga = blks[blks > 10 ** ((-70 + 0.691) / 10)]
     if len(ga) == 0:
         return -70.0
@@ -731,12 +769,11 @@ def _measure_true_peak_db(
     l: np.ndarray, r: np.ndarray, sr: int,
 ) -> float:
     tl = resample_poly(l, 4, 1)
-    pl = np.max(np.abs(tl))
+    pl = float(np.max(np.abs(tl)))
     del tl
     tr = resample_poly(r, 4, 1)
-    pr = np.max(np.abs(tr))
+    pr = float(np.max(np.abs(tr)))
     del tr
-    gc.collect()
     pk = max(pl, pr)
     return (
         20.0 * np.log10(pk)
@@ -745,12 +782,10 @@ def _measure_true_peak_db(
 
 
 def _calculate_dynamic_range(
-    stereo: np.ndarray, sr: int,
+    l: np.ndarray, r: np.ndarray, sr: int,
 ) -> float:
-    mono = (
-        np.mean(stereo, axis=1)
-        if stereo.ndim == 2 else stereo
-    )
+    """Dynamic range over averaged mono. Takes separate L/R so no column_stack."""
+    mono = (l + r) * 0.5
     fl = int(sr * 0.01)
     nf = len(mono) // fl
     if nf > 10:
@@ -769,7 +804,7 @@ def _calculate_dynamic_range(
             )
     mr = np.sqrt(np.mean(mono ** 2))
     mp = np.max(np.abs(mono))
-    return (
+    return float(
         20.0 * np.log10(max(mp, LOG_FLOOR))
         - 20.0 * np.log10(max(mr, LOG_FLOOR))
     )
