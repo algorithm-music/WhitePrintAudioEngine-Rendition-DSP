@@ -81,6 +81,33 @@ async def request_tracking_middleware(request: Request, call_next):
     return response
 
 
+# ──────────────────────────────────────────
+# Exception handlers — surface details to Cloud Logging stderr
+# ──────────────────────────────────────────
+# Without these, FastAPI puts HTTPException.detail into the response body
+# but never logs it, which made the "Failed to copy input file: [Errno 1]
+# Operation not permitted" class of bug invisible to remote operators.
+@app.exception_handler(HTTPException)
+async def _log_http_exception(request: Request, exc: HTTPException):
+    # 4xx is caller's problem — log at WARNING so the Cloud Logging
+    # error rate metric isn't poisoned by validation errors.
+    level = logger.warning if 400 <= exc.status_code < 500 else logger.error
+    level(f"{request.method} {request.url.path} → {exc.status_code}: {exc.detail}")
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+
+@app.exception_handler(Exception)
+async def _log_unhandled(request: Request, exc: Exception):
+    logger.error(
+        f"Unhandled {type(exc).__name__} on {request.method} {request.url.path}: {exc}",
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"{type(exc).__name__}: {exc}"},
+    )
+
+
 # ══════════════════════════════════════════
 # Endpoints
 # ══════════════════════════════════════════
