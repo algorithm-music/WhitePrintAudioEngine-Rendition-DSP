@@ -124,10 +124,14 @@ async def master(
             os.remove(local_in)
         raise HTTPException(status_code=500, detail=f"Failed to copy input file: {copy_err}")
 
-    output_path = req.output_path
-    if not output_path:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav", dir=TEMP_DIR) as tmp_out:
-            output_path = tmp_out.name
+    # libsndfile can't write directly through the GCSFuse mount in the
+    # general case (seek/truncate semantics). Always hand master_audio a
+    # local path; if the caller asked for an output on the FUSE mount,
+    # copy the finished WAV there afterwards.
+    final_output_path = req.output_path  # may be a FUSE path or None
+    fd_out, local_out = tempfile.mkstemp(suffix=".wav")
+    os.close(fd_out)
+    output_path = local_out
 
     try:
         metrics = await asyncio.to_thread(
@@ -140,7 +144,7 @@ async def master(
         )
     except Exception as e:
         logger.error(f"Mastering failed: {type(e).__name__}: {e}")
-        if req.output_path is None and os.path.exists(output_path):
+        if os.path.exists(output_path):
             os.remove(output_path)
         raise HTTPException(
             status_code=500,
@@ -149,6 +153,22 @@ async def master(
     finally:
         if os.path.exists(local_in):
             os.remove(local_in)
+
+    # If the caller wants the output on the FUSE mount, copy it there.
+    if final_output_path:
+        try:
+            os.makedirs(os.path.dirname(final_output_path), exist_ok=True)
+            await asyncio.to_thread(shutil.copyfile, local_out, final_output_path)
+        except Exception as copy_err:
+            logger.error(f"Failed to copy output to {final_output_path}: {copy_err}")
+            if os.path.exists(local_out):
+                os.remove(local_out)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to publish output: {copy_err}",
+            )
+        os.remove(local_out)
+        output_path = final_output_path
 
     # Direct push to client storage if requested
     if req.output_url:
