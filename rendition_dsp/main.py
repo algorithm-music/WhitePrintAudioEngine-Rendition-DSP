@@ -113,7 +113,10 @@ async def master(
     fd, local_in = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
     try:
-        await asyncio.to_thread(shutil.copy2, input_path, local_in)
+        # copyfile (not copy2) — copy2's copystat fails with EPERM on GCSFuse
+        # sources when the container runs as non-root (appuser); only the bytes
+        # need to land in /tmp, metadata preservation is irrelevant.
+        await asyncio.to_thread(shutil.copyfile, input_path, local_in)
         # Re-assign input_path to purely local file for the duration of the mastering step
         input_path = local_in
     except Exception as copy_err:
