@@ -46,8 +46,8 @@ def master_audio(
     input_path: str,
     output_path: str,
     params: dict,
-    target_lufs: float = -6.0,
-    target_true_peak: float = -0.1,
+    target_lufs: float,
+    target_true_peak: float,
 ) -> dict:
     """Apply 14-stage dynamic mastering chain with Newton-method convergence.
 
