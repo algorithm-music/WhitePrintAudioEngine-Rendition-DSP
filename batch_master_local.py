@@ -162,7 +162,7 @@ def main():
     try:
         r = httpx.get(f"{CONCERTMASTER_URL}/health", timeout=5.0)
         r.raise_for_status()
-        logger.info(f"Concertmaster OK: {r.json()}")
+        logger.info(f"Concertmaster OK (status={r.status_code})")
     except Exception as e:
         logger.error(f"Cannot reach Concertmaster at {CONCERTMASTER_URL}: {e}")
         logger.error("Run start_local_pipeline.bat first!")

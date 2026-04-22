@@ -51,12 +51,9 @@ def master_audio(
 ) -> dict:
     """Apply 14-stage dynamic mastering chain with Newton-method convergence.
 
-    v2.2 enhancements:
-    - Automatic saturation retreat: if true peak exceeds target for 2+
-      consecutive loops, saturation/parallel params are reduced by 20% each
-      iteration to prevent over-driven harmonics from causing clipping.
-    - Crest factor monitoring: tracks peak-to-RMS ratio to detect excessive
-      dynamic range compression.
+    All DSP parameters are determined by AI. No hardcoded defaults affect
+    the audio — if a parameter is not specified, the processing stage
+    is bypassed (neutral).
     """
     data, sr = sf.read(input_path, dtype="float32")
     if data.ndim == 1:
@@ -86,8 +83,6 @@ def master_audio(
 
     gain_adjustment = 0.0
     convergence_loops = 0
-    consecutive_peak_violations = 0
-    saturation_reduced = False
     # Holds the most-recent processed output; the final iteration's buffers
     # are what we write to disk (no per-iteration column_stack).
     curr_out_l: np.ndarray | None = None
@@ -120,37 +115,8 @@ def master_audio(
         if abs(lufs_diff) < CONVERGENCE_TOLERANCE_DB and peak_safe:
             break
 
-        # Track consecutive peak violations for saturation retreat
-        if current_peak > target_true_peak:
-            consecutive_peak_violations += 1
-        else:
-            consecutive_peak_violations = 0
-
-        # Saturation auto-retreat: if TP exceeded for 2+ consecutive loops,
-        # reduce saturation/parallel params by 20% to give the limiter headroom.
-        if consecutive_peak_violations >= 2:
-            _SAT_RETREAT_KEYS = [
-                "transformer_saturation", "transformer_mix",
-                "triode_drive", "triode_mix",
-                "tape_saturation", "tape_mix",
-                "parallel_wet",
-            ]
-            for sk in _SAT_RETREAT_KEYS:
-                old_val = active_params.get(sk, 0.0)
-                if old_val > 0.01:
-                    new_val = round(old_val * 0.80, 4)
-                    active_params[sk] = new_val
-            saturation_reduced = True
-            logger.warning(
-                f"Loop {convergence_loops}: TP exceeded {consecutive_peak_violations}x "
-                f"consecutively → saturation params reduced by 20%"
-            )
-
-        # Newton-method proportional control: 0.85 learning rate compensates
-        # for compressor gain reduction (gain/LUFS relationship is near-linear).
+        # Newton-method proportional control
         gain_adjustment -= lufs_diff * 0.85
-        if current_peak > target_true_peak:
-            gain_adjustment -= (current_peak - target_true_peak) * 1.0
 
     assert curr_out_l is not None and curr_out_r is not None
 
