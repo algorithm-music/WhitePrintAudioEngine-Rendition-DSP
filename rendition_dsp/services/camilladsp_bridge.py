@@ -90,8 +90,8 @@ def build_config(
     # ── Compressor parameters ──────────────────────────────────────
     comp_attack = _safe_float(params.get("comp_attack"), 0.01)
     comp_release = _safe_float(params.get("comp_release"), 0.15)
-    comp_threshold = _safe_float(params.get("comp_threshold"), -18.0)
-    comp_ratio = _safe_float(params.get("comp_ratio"), 3.0)
+    comp_threshold = _safe_float(params.get("comp_threshold"), 0.0)
+    comp_ratio = _safe_float(params.get("comp_ratio"), 1.0)
     comp_makeup = _safe_float(params.get("comp_makeup_gain"), 0.0)
 
     # ── Limiter parameters ─────────────────────────────────────────

@@ -320,7 +320,7 @@ def _apply_full_chain(
 
     # Parallel drive (waveshaping — Python only)
     pw = params.get("parallel_wet", 0.0)
-    pd = params.get("parallel_drive", 3.0)
+    pd = params.get("parallel_drive", 0.0)
     out_l = _neuro_drive(out_l, sr, wet=pw, drive=pd)
     out_r = _neuro_drive(out_r, sr, wet=pw, drive=pd)
 
@@ -371,8 +371,8 @@ def _apply_full_chain(
 
         # Compressor
         effects.append(Compressor(
-            threshold_db=params.get("comp_threshold_db", -14.0),
-            ratio=params.get("comp_ratio", 2.5),
+            threshold_db=params.get("comp_threshold_db", 0.0),
+            ratio=params.get("comp_ratio", 1.0),
             attack_ms=params.get("comp_attack_ms", 10.0),
             release_ms=params.get("comp_release_ms", 100.0),
         ))
@@ -457,12 +457,12 @@ def _apply_saturation_chain(
     buf: np.ndarray, sr: int, params: dict,
 ) -> np.ndarray:
     """Per-channel saturation: transformer + triode + tape at 8x OS, float32."""
-    ts = params.get("transformer_saturation", 0.3)
-    tm = params.get("transformer_mix", 0.4)
-    td = params.get("triode_drive", 0.4)
-    tx = params.get("triode_mix", 0.5)
-    ps = params.get("tape_saturation", 0.3)
-    pm = params.get("tape_mix", 0.4)
+    ts = params.get("transformer_saturation", 0.0)
+    tm = params.get("transformer_mix", 0.0)
+    td = params.get("triode_drive", 0.0)
+    tx = params.get("triode_mix", 0.0)
+    ps = params.get("tape_saturation", 0.0)
+    pm = params.get("tape_mix", 0.0)
 
     if max(ts, tm, td, tx, ps, pm) < 0.01:
         return buf
@@ -487,7 +487,7 @@ def _apply_saturation_chain(
             ).astype(np.float32, copy=False)
 
     if td >= 0.01 or tx >= 0.01:
-        bias = params.get("triode_bias", -1.2)
+        bias = params.get("triode_bias", 0.0)
         Vg = up * (td * 8.0 + 0.5) + bias
         st = math.sqrt(300.0 + 250.0 ** 2)
         inner = 600.0 * (1.0 / 100.0 + Vg / st)
@@ -587,8 +587,8 @@ def _apply_multiband_comp_stereo(
     left: np.ndarray, right: np.ndarray,
     sr: int, params: dict,
 ):
-    th_db = params.get("comp_threshold_db", -12)
-    rat = params.get("comp_ratio", 2.5)
+    th_db = params.get("comp_threshold_db", 0.0)
+    rat = params.get("comp_ratio", 1.0)
     att = params.get("comp_attack_sec", 0.01)
     rel = params.get("comp_release_sec", 0.15)
 
@@ -727,8 +727,8 @@ def _apply_freq_dep_width(
     mid: np.ndarray, side: np.ndarray,
     sr: int, params: dict,
 ):
-    lm = params.get("stereo_low_mono", 0.8)
-    hw = params.get("stereo_high_wide", 1.15)
+    lm = params.get("stereo_low_mono", 0.0)
+    hw = params.get("stereo_high_wide", 1.0)
     gw = params.get("stereo_width", 1.0)
     if 200.0 >= sr * 0.49 or 4000.0 >= sr * 0.49:
         return mid, side * gw
