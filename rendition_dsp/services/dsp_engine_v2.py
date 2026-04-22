@@ -83,6 +83,7 @@ def master_audio(
 
     gain_adjustment = 0.0
     convergence_loops = 0
+    saturation_reduced = False
     # Holds the most-recent processed output; the final iteration's buffers
     # are what we write to disk (no per-iteration column_stack).
     curr_out_l: np.ndarray | None = None
@@ -349,7 +350,7 @@ def _apply_full_chain(
             effects.append(Gain(gain_db=makeup))
 
         # Limiter (true peak) — ceiling follows AI-determined target_true_peak
-        limiter_ceil = params.get("limiter_ceiling_db", target_true_peak)
+        limiter_ceil = params.get("limiter_ceiling_db", params.get("limiter_ceil_db", -0.1))
         effects.append(Limiter(
             threshold_db=limiter_ceil,
             release_ms=params.get("limiter_release_ms", 50.0),
@@ -397,7 +398,7 @@ def _apply_full_chain(
         out_r = _soft_clipper(out_r, threshold=ct)
 
     if params.get("limiter_enabled", False):
-        cd = params.get("limiter_ceil_db", target_true_peak)
+        cd = params.get("limiter_ceil_db", -0.1)
         out_l, out_r = _apply_tp_limiter(out_l, out_r, sr, cd)
 
     if params.get("dither_enabled", True):
