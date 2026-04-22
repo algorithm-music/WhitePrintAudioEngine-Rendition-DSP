@@ -1,7 +1,7 @@
 # pyre-ignore-all-errors
 
 """
-RENDITION_DSP Engine v3.0 — Hybrid CamillaDSP + Python Mastering Chain
+RENDITION_DSP Engine v3.1 — Hybrid Pedalboard (JUCE) + Python Mastering Chain
 
 Signal flow (hybrid):
  Python pre-stage:
@@ -10,17 +10,19 @@ Signal flow (hybrid):
   6 Dynamic EQ -> 7 M/S Encode -> 8 Freq-Dep Width ->
   9 Parallel Drive ->
 
- CamillaDSP (Rust, 64-bit float):
-  10 Parametric EQ (Biquad) -> 11 Compressor -> 12 Limiter -> 13 Dither
+ Spotify Pedalboard (JUCE C++, in-process):
+  10 Parametric EQ (Biquad Shelf/Peak) -> 11 Compressor -> 12 Limiter
+  13 TPDF Dither (Python)
 
- Fallback: full Python pipeline if CamillaDSP binary unavailable.
+ Fallback: full Python/scipy pipeline if pedalboard unavailable.
 
-v3.0 changes:
-- EQ, compression, limiting, dither delegated to CamillaDSP (Rust engine)
-  for 64-bit precision and SIMD-optimized filtering.
+v3.1 changes:
+- Replaced CamillaDSP (external Rust binary) with Spotify Pedalboard (JUCE).
+  No subprocess, no temp files, no libasound2 dependency — pure pip install.
+- EQ, compression, limiting run in-process via JUCE C++ bindings.
 - Python retains analog saturation modeling (transformer/triode/tape),
   dynamic EQ, M/S processing — these are the unique value-add.
-- Graceful fallback to scipy pipeline if CamillaDSP is not available.
+- Graceful fallback to scipy pipeline if pedalboard is not installed.
 """
 
 import gc
@@ -322,77 +324,102 @@ def _apply_full_chain(
     out_l = _neuro_drive(out_l, sr, wet=pw, drive=pd)
     out_r = _neuro_drive(out_r, sr, wet=pw, drive=pd)
 
-    # ── CamillaDSP stages: EQ → Comp → Limiter → Dither ──────────
+    # ── Spotify Pedalboard stages: EQ → Comp → Limiter ───────────
     try:
-        from rendition_dsp.services.camilladsp_bridge import run_camilladsp
-        import tempfile
-
-        _tmp_dir = os.environ.get("TMPDIR", "/tmp")
-
-        # Write intermediate stereo WAV for CamillaDSP input
-        inter_stereo = np.column_stack([out_l, out_r]).astype(np.float32, copy=False)
-        inter_fd, inter_path = tempfile.mkstemp(
-            suffix=".wav", prefix="cdsp_in_", dir=_tmp_dir,
+        from pedalboard import (
+            Pedalboard, Compressor, Limiter, Gain,
+            HighShelfFilter, LowShelfFilter, PeakFilter,
+            HighpassFilter, Clipping,
         )
-        os.close(inter_fd)
-        sf.write(inter_path, inter_stereo, sr, format="WAV", subtype="FLOAT")
-        del inter_stereo
+
+        # Build pedalboard chain from mastering params
+        effects = []
+
+        # DC remove (5 Hz highpass)
+        effects.append(HighpassFilter(cutoff_frequency_hz=5.0))
+
+        # Parametric EQ — 4-band (shelf + peak)
+        ls_gain = params.get("eq_low_shelf_gain_db", 0.0)
+        if abs(ls_gain) > 0.01:
+            effects.append(LowShelfFilter(
+                cutoff_frequency_hz=params.get("eq_low_shelf_freq", 80),
+                gain_db=ls_gain,
+            ))
+
+        lm_gain = params.get("eq_low_mid_gain_db", 0.0)
+        if abs(lm_gain) > 0.01:
+            effects.append(PeakFilter(
+                cutoff_frequency_hz=params.get("eq_low_mid_freq", 300),
+                gain_db=lm_gain,
+                q=params.get("eq_low_mid_q", 1.0),
+            ))
+
+        hm_gain = params.get("eq_high_mid_gain_db", 0.0)
+        if abs(hm_gain) > 0.01:
+            effects.append(PeakFilter(
+                cutoff_frequency_hz=params.get("eq_high_mid_freq", 3000),
+                gain_db=hm_gain,
+                q=params.get("eq_high_mid_q", 1.2),
+            ))
+
+        hs_gain = params.get("eq_high_shelf_gain_db", 0.0)
+        if abs(hs_gain) > 0.01:
+            effects.append(HighShelfFilter(
+                cutoff_frequency_hz=params.get("eq_high_shelf_freq", 10000),
+                gain_db=hs_gain,
+            ))
+
+        # Compressor
+        effects.append(Compressor(
+            threshold_db=params.get("comp_threshold_db", -14.0),
+            ratio=params.get("comp_ratio", 2.5),
+            attack_ms=params.get("comp_attack_ms", 10.0),
+            release_ms=params.get("comp_release_ms", 100.0),
+        ))
+
+        # Makeup gain from compressor
+        makeup = params.get("comp_makeup_db", 0.0)
+        if abs(makeup) > 0.01:
+            effects.append(Gain(gain_db=makeup))
+
+        # Limiter (true peak)
+        limiter_ceil = params.get("limiter_ceiling_db", -1.0)
+        effects.append(Limiter(
+            threshold_db=limiter_ceil,
+            release_ms=params.get("limiter_release_ms", 50.0),
+        ))
+
+        board = Pedalboard(effects)
+
+        # Process in-memory (interleaved stereo, float32)
+        # Pedalboard expects shape (channels, samples)
+        stereo = np.stack([out_l, out_r], axis=0).astype(np.float32, copy=False)
+        processed = board(stereo, sr)
+        out_l = np.ascontiguousarray(processed[0], dtype=np.float32)
+        out_r = np.ascontiguousarray(processed[1], dtype=np.float32)
+        del stereo, processed
         gc.collect()
 
-        cdsp_fd, cdsp_out_path = tempfile.mkstemp(
-            suffix=".wav", prefix="cdsp_out_", dir=_tmp_dir,
-        )
-        os.close(cdsp_fd)
+        logger.info("Pedalboard (JUCE) processing completed successfully.")
 
-        # Run CamillaDSP (EQ + Compressor + Limiter + Dither)
-        # gain_adj is already applied above, so pass 0 to avoid double-applying
-        cdsp_result = run_camilladsp(
-            input_path=inter_path,
-            output_path=cdsp_out_path,
-            sr=sr,
-            params=params,
-            gain_adj=0.0,  # already applied in Python pre-stage
-            timeout_sec=90.0,
-        )
-
-        if cdsp_result["success"] and os.path.exists(cdsp_out_path):
-            logger.info("CamillaDSP hybrid path succeeded — reading output.")
-            cdsp_data, _ = sf.read(cdsp_out_path, dtype="float32")
-            if cdsp_data.ndim == 1:
-                cdsp_data = np.column_stack([cdsp_data, cdsp_data])
-            out_l = np.ascontiguousarray(cdsp_data[:, 0], dtype=np.float32)
-            out_r = np.ascontiguousarray(
-                cdsp_data[:, 1] if cdsp_data.shape[1] >= 2 else cdsp_data[:, 0],
-                dtype=np.float32,
+        # TPDF dither (kept in Python — pedalboard doesn't have dither)
+        if params.get("dither_enabled", True):
+            db = params.get("dither_bits", 24)
+            out_l = _apply_dither(
+                out_l, target_bits=db, channel_idx=0, seed=dither_seed,
             )
-            del cdsp_data
-            gc.collect()
-
-            # Clean up temp files
-            for p in (inter_path, cdsp_out_path):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-
-            return out_l, out_r
-        else:
-            logger.warning(
-                f"CamillaDSP failed ({cdsp_result.get('error', 'unknown')}), "
-                f"falling back to Python DSP pipeline."
+            out_r = _apply_dither(
+                out_r, target_bits=db, channel_idx=1, seed=dither_seed,
             )
-            # Clean up temp files
-            for p in (inter_path, cdsp_out_path):
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-            # Fall through to Python fallback below
 
+        return out_l, out_r
+
+    except ImportError:
+        logger.warning("pedalboard not installed, falling back to scipy DSP.")
     except Exception as e:
-        logger.warning(f"CamillaDSP bridge error: {e}, falling back to Python DSP.")
+        logger.warning(f"Pedalboard error: {e}, falling back to scipy DSP.")
 
-    # ── Python fallback (original scipy pipeline) ─────────────────
+    # ── Python/scipy fallback ─────────────────────────────────────
     out_l = _apply_parametric_eq(out_l, sr, params, "mid")
     out_r = _apply_parametric_eq(out_r, sr, params, "mid")
 
