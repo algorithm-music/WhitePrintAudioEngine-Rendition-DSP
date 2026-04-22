@@ -391,12 +391,12 @@ def _apply_full_chain(
 
     out_l, out_r = _apply_multiband_comp_stereo(out_l, out_r, sr, params)
 
-    if params.get("soft_clip_enabled", 1):
+    if params.get("soft_clip_enabled", 0):
         ct = params.get("soft_clip_threshold", 0.98)
         out_l = _soft_clipper(out_l, threshold=ct)
         out_r = _soft_clipper(out_r, threshold=ct)
 
-    if params.get("limiter_enabled", True):
+    if params.get("limiter_enabled", False):
         cd = params.get("limiter_ceil_db", target_true_peak)
         out_l, out_r = _apply_tp_limiter(out_l, out_r, sr, cd)
 

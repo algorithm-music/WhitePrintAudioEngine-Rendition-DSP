@@ -95,7 +95,7 @@ def build_config(
     comp_makeup = _safe_float(params.get("comp_makeup_gain"), 0.0)
 
     # ── Limiter parameters ─────────────────────────────────────────
-    limiter_ceil_db = _safe_float(params.get("limiter_ceil_db"), -0.1)
+    limiter_ceil_db = _safe_float(params.get("limiter_ceil_db"), 0.0)
 
     # ── Dither parameters ──────────────────────────────────────────
     dither_bits = int(_safe_float(params.get("dither_bits"), 24))
@@ -183,7 +183,7 @@ def build_config(
         "type": "Limiter",
         "parameters": {
             "clip_limit": round(limiter_ceil_db, 2),
-            "soft_clip": True,
+            "soft_clip": bool(params.get("soft_clip_enabled", False)),
         },
     }
 
@@ -210,7 +210,7 @@ def build_config(
             "threshold": round(comp_threshold, 1),
             "factor": round(max(1.0, comp_ratio), 2),
             "makeup_gain": round(comp_makeup, 2),
-            "soft_clip": True,
+            "soft_clip": bool(params.get("soft_clip_enabled", False)),
             "clip_limit": round(limiter_ceil_db, 2),
         },
     }
