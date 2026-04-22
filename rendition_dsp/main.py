@@ -380,10 +380,16 @@ async def master_url(req: MasterUrlRequest, background_tasks: BackgroundTasks) -
 @app.get("/")
 async def index() -> JSONResponse:
     """Root endpoint providing service identity."""
+    import shutil
+    cdsp_bin = shutil.which("camilladsp") or "/usr/local/bin/camilladsp"
+    cdsp_avail = os.path.isfile(cdsp_bin)
     return JSONResponse(content={
         "status": "online",
         "service": "rendition_dsp",
-        "engine": "14-Stage Analog-Modeled Mastering Chain",
+        "engine": "Hybrid CamillaDSP (Rust) + Python Mastering Chain",
+        "version": "3.0.0",
+        "camilladsp_available": cdsp_avail,
+        "dsp_backend": "camilladsp" if cdsp_avail else "scipy-fallback",
         "message": "Audio DSP rendering microservice is ready.",
         "documentation": "/docs"
     })
@@ -391,11 +397,15 @@ async def index() -> JSONResponse:
 
 @app.get("/health")
 async def health() -> JSONResponse:
+    import shutil
+    cdsp_bin = shutil.which("camilladsp") or "/usr/local/bin/camilladsp"
+    cdsp_avail = os.path.isfile(cdsp_bin)
     return JSONResponse(content={
         "status": "ready",
         "service": "rendition_dsp",
-        "version": "2.0.0",
-        "engine": "14-Stage Analog-Modeled Mastering Chain",
-        "stages": 14,
+        "version": "3.0.0",
+        "engine": "Hybrid CamillaDSP (Rust) + Python",
+        "camilladsp_available": cdsp_avail,
+        "dsp_backend": "camilladsp" if cdsp_avail else "scipy-fallback",
         "stores_audio": False,
     })
