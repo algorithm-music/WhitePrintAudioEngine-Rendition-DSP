@@ -49,7 +49,12 @@ logger = logging.getLogger("rendition_dsp")
 # ──────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    logger.info("RENDITION_DSP Engine v2 (14-stage mastering chain) is online.")
+    import shutil
+    cdsp_bin = shutil.which("camilladsp") or "/usr/local/bin/camilladsp"
+    cdsp_avail = os.path.isfile(cdsp_bin)
+    logger.info(
+        f"RENDITION_DSP Engine v3.0 (Hybrid CamillaDSP + Python) is online. "
+        f"CamillaDSP binary: {'FOUND' if cdsp_avail else 'NOT FOUND (Python fallback)'}")
     yield
     logger.info("RENDITION_DSP Engine shutting down.")
 
@@ -59,8 +64,8 @@ async def lifespan(application: FastAPI):
 # ──────────────────────────────────────────
 app = FastAPI(
     title="rendition_dsp",
-    description="14-Stage Analog-Modeled Mastering Chain",
-    version="2.0.0",
+    description="Hybrid CamillaDSP (Rust) + Python Mastering Chain",
+    version="3.0.0",
     lifespan=lifespan,
 )
 

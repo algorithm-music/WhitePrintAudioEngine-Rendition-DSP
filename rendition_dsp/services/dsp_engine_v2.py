@@ -1,26 +1,26 @@
 # pyre-ignore-all-errors
 
 """
-RENDITION_DSP Engine v2.1 — 14-Stage Mastering Chain with Dynamic Automation (Memory-Safe)
+RENDITION_DSP Engine v3.0 — Hybrid CamillaDSP + Python Mastering Chain
 
-Signal flow:
- 1 DC Remove -> 2 Gain Stage ->
- 3 Transformer Sat -> 4 Triode Tube -> 5 Tape Emulation ->
- 6 M/S Encode ->
- 7 Parametric EQ -> 8 Dynamic EQ -> 9 4-Band Comp ->
- 10 Parallel Drive -> 11 Freq-Dep Width -> 12 Soft Clipper ->
- M/S Decode ->
- 13 TP Limiter v2 -> 14 TPDF Dither
+Signal flow (hybrid):
+ Python pre-stage:
+  1 DC Remove -> 2 Gain Stage ->
+  3 Transformer Sat -> 4 Triode Tube -> 5 Tape Emulation ->
+  6 Dynamic EQ -> 7 M/S Encode -> 8 Freq-Dep Width ->
+  9 Parallel Drive ->
 
-Memory-safety changes (v2.1):
-- float32 throughout (no float64 upcast) — halves RAM.
-- Oversampled stages (saturation 8x, soft clip 4x, TP limiter 8x) now process
-  L and R sequentially, not as a stacked (N, 2) array. Peak RAM during
-  resample_poly is cut roughly in half.
-- Convergence loop avoids redundant .copy() and column_stack per iteration.
-- TP limiter reuses a single upsampled buffer with in-place np.abs + block-max
-  so L and R upsamples never coexist in RAM.
-- dynamic_range measurement takes separate l/r without building an (N, 2) stereo.
+ CamillaDSP (Rust, 64-bit float):
+  10 Parametric EQ (Biquad) -> 11 Compressor -> 12 Limiter -> 13 Dither
+
+ Fallback: full Python pipeline if CamillaDSP binary unavailable.
+
+v3.0 changes:
+- EQ, compression, limiting, dither delegated to CamillaDSP (Rust engine)
+  for 64-bit precision and SIMD-optimized filtering.
+- Python retains analog saturation modeling (transformer/triode/tape),
+  dynamic EQ, M/S processing — these are the unique value-add.
+- Graceful fallback to scipy pipeline if CamillaDSP is not available.
 """
 
 import gc
