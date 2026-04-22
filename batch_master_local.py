@@ -114,8 +114,6 @@ def submit_job(client: httpx.Client, input_path: str, output_path: str) -> str:
             "input_path": input_path,
             "output_path": output_path,
             "route": "full",
-            "target_lufs": -14.0,
-            "target_true_peak": -1.0,
         },
         headers={
             "X-Api-Key": API_KEY,

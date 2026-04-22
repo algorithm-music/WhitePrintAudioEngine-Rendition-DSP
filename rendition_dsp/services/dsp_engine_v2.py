@@ -382,8 +382,8 @@ def _apply_full_chain(
         if abs(makeup) > 0.01:
             effects.append(Gain(gain_db=makeup))
 
-        # Limiter (true peak)
-        limiter_ceil = params.get("limiter_ceiling_db", -1.0)
+        # Limiter (true peak) — ceiling follows AI-determined target_true_peak
+        limiter_ceil = params.get("limiter_ceiling_db", target_true_peak)
         effects.append(Limiter(
             threshold_db=limiter_ceil,
             release_ms=params.get("limiter_release_ms", 50.0),
@@ -431,7 +431,7 @@ def _apply_full_chain(
         out_r = _soft_clipper(out_r, threshold=ct)
 
     if params.get("limiter_enabled", True):
-        cd = params.get("limiter_ceil_db", -0.1)
+        cd = params.get("limiter_ceil_db", target_true_peak)
         out_l, out_r = _apply_tp_limiter(out_l, out_r, sr, cd)
 
     if params.get("dither_enabled", True):
