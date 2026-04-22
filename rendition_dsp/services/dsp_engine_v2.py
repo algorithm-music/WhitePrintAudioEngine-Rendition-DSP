@@ -279,7 +279,23 @@ def _apply_full_chain(
     sr: int, params: dict, gain_adj: float,
     dither_seed: int = 0,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Apply stages 2-14. Oversampled stages run sequentially per channel."""
+    """Hybrid mastering chain: Python (saturation) → CamillaDSP (EQ/comp/limit/dither).
+
+    Stages handled in Python (analog modeling — not available in CamillaDSP):
+      - Input gain
+      - Transformer / Triode / Tape saturation (8x oversampled)
+      - M/S frequency-dependent width
+      - Parallel drive (waveshaping)
+      - Dynamic EQ
+
+    Stages delegated to CamillaDSP (Rust, 64-bit, SIMD-optimized):
+      - DC Remove (Biquad HighpassFO 5 Hz)
+      - Parametric EQ (Biquad Peaking/Shelf bands)
+      - Compressor (attack/release/threshold/ratio/makeup)
+      - Limiter (soft clip)
+      - TPDF Dither
+    """
+    # ── Python pre-stages: saturation & spatial ───────────────────
     g = _db_to_linear(params.get("input_gain_db", 0) + gain_adj)
     left *= g  # in-place; caller passed a copy.
     right *= g
@@ -288,12 +304,11 @@ def _apply_full_chain(
     left = _apply_saturation_chain(left, sr, params)
     right = _apply_saturation_chain(right, sr, params)
 
-    left = _apply_parametric_eq(left, sr, params, "mid")
-    right = _apply_parametric_eq(right, sr, params, "mid")
-
+    # Dynamic EQ (Python — CamillaDSP has no dynamic EQ)
     left = _apply_dynamic_eq(left, sr, params)
     right = _apply_dynamic_eq(right, sr, params)
 
+    # M/S processing + frequency-dependent width
     mid = (left + right) * 0.5
     side = (left - right) * 0.5
     mid, side = _apply_freq_dep_width(mid, side, sr, params)
@@ -301,16 +316,90 @@ def _apply_full_chain(
     out_r = mid - side
     del mid, side
 
+    # Parallel drive (waveshaping — Python only)
     pw = params.get("parallel_wet", 0.0)
     pd = params.get("parallel_drive", 3.0)
     out_l = _neuro_drive(out_l, sr, wet=pw, drive=pd)
     out_r = _neuro_drive(out_r, sr, wet=pw, drive=pd)
 
+    # ── CamillaDSP stages: EQ → Comp → Limiter → Dither ──────────
+    try:
+        from rendition_dsp.services.camilladsp_bridge import run_camilladsp
+        import tempfile
+
+        _tmp_dir = os.environ.get("TMPDIR", "/tmp")
+
+        # Write intermediate stereo WAV for CamillaDSP input
+        inter_stereo = np.column_stack([out_l, out_r]).astype(np.float32, copy=False)
+        inter_fd, inter_path = tempfile.mkstemp(
+            suffix=".wav", prefix="cdsp_in_", dir=_tmp_dir,
+        )
+        os.close(inter_fd)
+        sf.write(inter_path, inter_stereo, sr, format="WAV", subtype="FLOAT")
+        del inter_stereo
+        gc.collect()
+
+        cdsp_fd, cdsp_out_path = tempfile.mkstemp(
+            suffix=".wav", prefix="cdsp_out_", dir=_tmp_dir,
+        )
+        os.close(cdsp_fd)
+
+        # Run CamillaDSP (EQ + Compressor + Limiter + Dither)
+        # gain_adj is already applied above, so pass 0 to avoid double-applying
+        cdsp_result = run_camilladsp(
+            input_path=inter_path,
+            output_path=cdsp_out_path,
+            sr=sr,
+            params=params,
+            gain_adj=0.0,  # already applied in Python pre-stage
+            timeout_sec=90.0,
+        )
+
+        if cdsp_result["success"] and os.path.exists(cdsp_out_path):
+            logger.info("CamillaDSP hybrid path succeeded — reading output.")
+            cdsp_data, _ = sf.read(cdsp_out_path, dtype="float32")
+            if cdsp_data.ndim == 1:
+                cdsp_data = np.column_stack([cdsp_data, cdsp_data])
+            out_l = np.ascontiguousarray(cdsp_data[:, 0], dtype=np.float32)
+            out_r = np.ascontiguousarray(
+                cdsp_data[:, 1] if cdsp_data.shape[1] >= 2 else cdsp_data[:, 0],
+                dtype=np.float32,
+            )
+            del cdsp_data
+            gc.collect()
+
+            # Clean up temp files
+            for p in (inter_path, cdsp_out_path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+            return out_l, out_r
+        else:
+            logger.warning(
+                f"CamillaDSP failed ({cdsp_result.get('error', 'unknown')}), "
+                f"falling back to Python DSP pipeline."
+            )
+            # Clean up temp files
+            for p in (inter_path, cdsp_out_path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            # Fall through to Python fallback below
+
+    except Exception as e:
+        logger.warning(f"CamillaDSP bridge error: {e}, falling back to Python DSP.")
+
+    # ── Python fallback (original scipy pipeline) ─────────────────
+    out_l = _apply_parametric_eq(out_l, sr, params, "mid")
+    out_r = _apply_parametric_eq(out_r, sr, params, "mid")
+
     out_l, out_r = _apply_multiband_comp_stereo(out_l, out_r, sr, params)
 
     if params.get("soft_clip_enabled", 1):
         ct = params.get("soft_clip_threshold", 0.98)
-        # Sequential (4x OS) — no stacked stereo buffer.
         out_l = _soft_clipper(out_l, threshold=ct)
         out_r = _soft_clipper(out_r, threshold=ct)
 

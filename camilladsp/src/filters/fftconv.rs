@@ -1,0 +1,567 @@
+// CamillaDSP - A flexible tool for processing audio
+// Copyright (C) 2026 Henrik Enquist
+//
+// This file is part of CamillaDSP.
+//
+// CamillaDSP is free software; you can redistribute it and/or modify it
+// under the terms of either:
+//
+// a) the GNU General Public License version 3,
+//    or
+// b) the Mozilla Public License Version 2.0.
+//
+// You should have received copies of the GNU General Public License and the
+// Mozilla Public License along with this program. If not, see
+// <https://www.gnu.org/licenses/> and <https://www.mozilla.org/MPL/2.0/>.
+
+use crate::config;
+use crate::filters;
+use crate::filters::Filter;
+use num_complex::Complex;
+use num_traits::Zero;
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
+use std::sync::Arc;
+
+// Sample format
+use crate::PrcFmt;
+use crate::Res;
+
+#[cfg(target_arch = "aarch64")]
+#[path = "fftconv_neon.rs"]
+mod neon;
+
+#[cfg(target_arch = "x86_64")]
+#[path = "fftconv_avx.rs"]
+mod avx;
+
+// element-wise product, result = slice_a * slice_b
+#[cfg(any(not(target_arch = "aarch64"), test, feature = "bench"))]
+fn multiply_elements_scalar(
+    result: &mut [Complex<PrcFmt>],
+    slice_a: &[Complex<PrcFmt>],
+    slice_b: &[Complex<PrcFmt>],
+) {
+    let len = result.len();
+    let mut res = &mut result[..len];
+    let mut val_a = &slice_a[..len];
+    let mut val_b = &slice_b[..len];
+
+    unsafe {
+        while res.len() >= 8 {
+            *res.get_unchecked_mut(0) = *val_a.get_unchecked(0) * *val_b.get_unchecked(0);
+            *res.get_unchecked_mut(1) = *val_a.get_unchecked(1) * *val_b.get_unchecked(1);
+            *res.get_unchecked_mut(2) = *val_a.get_unchecked(2) * *val_b.get_unchecked(2);
+            *res.get_unchecked_mut(3) = *val_a.get_unchecked(3) * *val_b.get_unchecked(3);
+            *res.get_unchecked_mut(4) = *val_a.get_unchecked(4) * *val_b.get_unchecked(4);
+            *res.get_unchecked_mut(5) = *val_a.get_unchecked(5) * *val_b.get_unchecked(5);
+            *res.get_unchecked_mut(6) = *val_a.get_unchecked(6) * *val_b.get_unchecked(6);
+            *res.get_unchecked_mut(7) = *val_a.get_unchecked(7) * *val_b.get_unchecked(7);
+            res = &mut res[8..];
+            val_a = val_a.get_unchecked(8..);
+            val_b = val_b.get_unchecked(8..);
+        }
+    }
+    for (r, val) in res
+        .iter_mut()
+        .zip(val_a.iter().zip(val_b.iter()).map(|(a, b)| *a * *b))
+    {
+        *r = val;
+    }
+}
+
+// element-wise add product, result = result + slice_a * slice_b
+#[cfg(any(not(target_arch = "aarch64"), test, feature = "bench"))]
+fn multiply_add_elements_scalar(
+    result: &mut [Complex<PrcFmt>],
+    slice_a: &[Complex<PrcFmt>],
+    slice_b: &[Complex<PrcFmt>],
+) {
+    let len = result.len();
+    let mut res = &mut result[..len];
+    let mut val_a = &slice_a[..len];
+    let mut val_b = &slice_b[..len];
+
+    unsafe {
+        while res.len() >= 8 {
+            *res.get_unchecked_mut(0) += *val_a.get_unchecked(0) * *val_b.get_unchecked(0);
+            *res.get_unchecked_mut(1) += *val_a.get_unchecked(1) * *val_b.get_unchecked(1);
+            *res.get_unchecked_mut(2) += *val_a.get_unchecked(2) * *val_b.get_unchecked(2);
+            *res.get_unchecked_mut(3) += *val_a.get_unchecked(3) * *val_b.get_unchecked(3);
+            *res.get_unchecked_mut(4) += *val_a.get_unchecked(4) * *val_b.get_unchecked(4);
+            *res.get_unchecked_mut(5) += *val_a.get_unchecked(5) * *val_b.get_unchecked(5);
+            *res.get_unchecked_mut(6) += *val_a.get_unchecked(6) * *val_b.get_unchecked(6);
+            *res.get_unchecked_mut(7) += *val_a.get_unchecked(7) * *val_b.get_unchecked(7);
+            res = &mut res[8..];
+            val_a = val_a.get_unchecked(8..);
+            val_b = val_b.get_unchecked(8..);
+        }
+    }
+    for (r, val) in res
+        .iter_mut()
+        .zip(val_a.iter().zip(val_b.iter()).map(|(a, b)| *a * *b))
+    {
+        *r += val;
+    }
+}
+
+// Element-wise product: result = slice_a * slice_b.
+// Dispatches to NEON (aarch64), AVX+FMA (x86_64 with runtime support), or scalar.
+#[inline]
+fn multiply_elements(
+    result: &mut [Complex<PrcFmt>],
+    slice_a: &[Complex<PrcFmt>],
+    slice_b: &[Complex<PrcFmt>],
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is mandatory on all AArch64 implementations.
+        unsafe { neon::multiply_elements_neon(result, slice_a, slice_b) };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx::has_avx_fma() {
+            // SAFETY: AVX and FMA support has been verified by has_avx_fma().
+            unsafe { avx::multiply_elements_avx_fma(result, slice_a, slice_b) };
+        } else {
+            multiply_elements_scalar(result, slice_a, slice_b);
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    multiply_elements_scalar(result, slice_a, slice_b);
+}
+
+// Element-wise accumulate product: result += slice_a * slice_b.
+// Dispatches to NEON (aarch64), AVX+FMA (x86_64 with runtime support), or scalar.
+#[inline]
+fn multiply_add_elements(
+    result: &mut [Complex<PrcFmt>],
+    slice_a: &[Complex<PrcFmt>],
+    slice_b: &[Complex<PrcFmt>],
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is mandatory on all AArch64 implementations.
+        unsafe { neon::multiply_add_elements_neon(result, slice_a, slice_b) };
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if avx::has_avx_fma() {
+            // SAFETY: AVX and FMA support has been verified by has_avx_fma().
+            unsafe { avx::multiply_add_elements_avx_fma(result, slice_a, slice_b) };
+        } else {
+            multiply_add_elements_scalar(result, slice_a, slice_b);
+        }
+    }
+
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    multiply_add_elements_scalar(result, slice_a, slice_b);
+}
+
+pub struct FftConv {
+    name: String,
+    npoints: usize,
+    nsegments: usize,
+    overlap: Vec<PrcFmt>,
+    coeffs_f: Vec<Vec<Complex<PrcFmt>>>,
+    fft: Arc<dyn RealToComplex<PrcFmt>>,
+    ifft: Arc<dyn ComplexToReal<PrcFmt>>,
+    scratch_fw: Vec<Complex<PrcFmt>>,
+    scratch_inv: Vec<Complex<PrcFmt>>,
+    input_buf: Vec<PrcFmt>,
+    input_f: Vec<Vec<Complex<PrcFmt>>>,
+    temp_buf: Vec<Complex<PrcFmt>>,
+    output_buf: Vec<PrcFmt>,
+    index: usize,
+}
+
+impl FftConv {
+    /// Create a new FFT convolution filter.
+    pub fn new(name: &str, data_length: usize, coeffs: &[PrcFmt]) -> Self {
+        let name = name.to_string();
+        let input_buf: Vec<PrcFmt> = vec![0.0; 2 * data_length];
+        let temp_buf: Vec<Complex<PrcFmt>> = vec![Complex::zero(); data_length + 1];
+        let output_buf: Vec<PrcFmt> = vec![0.0; 2 * data_length];
+        let mut planner = RealFftPlanner::<PrcFmt>::new();
+        let fft = planner.plan_fft_forward(2 * data_length);
+        let ifft = planner.plan_fft_inverse(2 * data_length);
+        let mut scratch_fw = fft.make_scratch_vec();
+        let scratch_inv = ifft.make_scratch_vec();
+
+        let nsegments = ((coeffs.len() as PrcFmt) / (data_length as PrcFmt)).ceil() as usize;
+
+        let input_f = vec![vec![Complex::zero(); data_length + 1]; nsegments];
+        let mut coeffs_padded = vec![vec![0.0; 2 * data_length]; nsegments];
+        let mut coeffs_f = vec![vec![Complex::zero(); data_length + 1]; nsegments];
+
+        debug!("Conv {name} is using {nsegments} segments");
+
+        for (n, coeff) in coeffs.iter().enumerate() {
+            coeffs_padded[n / data_length][n % data_length] = coeff / (2 * data_length) as PrcFmt;
+        }
+
+        for (segment, segment_f) in coeffs_padded.iter_mut().zip(coeffs_f.iter_mut()) {
+            fft.process_with_scratch(segment, segment_f, &mut scratch_fw)
+                .unwrap();
+        }
+
+        FftConv {
+            name,
+            npoints: data_length,
+            nsegments,
+            overlap: vec![0.0; data_length],
+            coeffs_f,
+            fft,
+            ifft,
+            scratch_fw,
+            scratch_inv,
+            input_f,
+            input_buf,
+            output_buf,
+            temp_buf,
+            index: 0,
+        }
+    }
+
+    pub fn from_config(name: &str, data_length: usize, conf: config::ConvParameters) -> Self {
+        let values = match conf {
+            config::ConvParameters::Values { values } => values,
+            config::ConvParameters::Raw(params) => filters::read_coeff_file(
+                &params.filename,
+                &params.format(),
+                params.read_bytes_lines(),
+                params.skip_bytes_lines(),
+            )
+            .unwrap(),
+            config::ConvParameters::Wav(params) => {
+                filters::read_wav(&params.filename, params.channel()).unwrap()
+            }
+            config::ConvParameters::Dummy { length } => {
+                let mut values = vec![0.0; length];
+                values[0] = 1.0;
+                values
+            }
+        };
+        FftConv::new(name, data_length, &values)
+    }
+}
+
+impl Filter for FftConv {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Process a waveform by FT, then multiply transform with transform of filter, and then transform back.
+    fn process_waveform(&mut self, waveform: &mut [PrcFmt]) -> Res<()> {
+        // Copy to input buffer and clear overlap area
+        self.input_buf[0..self.npoints].copy_from_slice(waveform);
+        for item in self
+            .input_buf
+            .iter_mut()
+            .skip(self.npoints)
+            .take(self.npoints)
+        {
+            *item = 0.0;
+        }
+
+        // FFT and store result in history, update index
+        self.index = (self.index + 1) % self.nsegments;
+        self.fft
+            .process_with_scratch(
+                &mut self.input_buf,
+                &mut self.input_f[self.index],
+                &mut self.scratch_fw,
+            )
+            .unwrap();
+
+        // Loop through history of input FTs, multiply with filter FTs, accumulate result
+        let segm = 0;
+        let hist_idx = (self.index + self.nsegments - segm) % self.nsegments;
+        multiply_elements(
+            &mut self.temp_buf,
+            &self.input_f[hist_idx],
+            &self.coeffs_f[segm],
+        );
+        for segm in 1..self.nsegments {
+            let hist_idx = (self.index + self.nsegments - segm) % self.nsegments;
+            multiply_add_elements(
+                &mut self.temp_buf,
+                &self.input_f[hist_idx],
+                &self.coeffs_f[segm],
+            );
+        }
+
+        // IFFT result, store result and overlap
+        self.ifft
+            .process_with_scratch(
+                &mut self.temp_buf,
+                &mut self.output_buf,
+                &mut self.scratch_inv,
+            )
+            .unwrap();
+        for (n, item) in waveform.iter_mut().enumerate().take(self.npoints) {
+            *item = self.output_buf[n] + self.overlap[n];
+        }
+        self.overlap
+            .copy_from_slice(&self.output_buf[self.npoints..]);
+        Ok(())
+    }
+
+    fn update_parameters(&mut self, conf: config::Filter) {
+        if let config::Filter::Conv {
+            parameters: conf, ..
+        } = conf
+        {
+            let coeffs = match conf {
+                config::ConvParameters::Values { values } => values,
+                config::ConvParameters::Raw(params) => filters::read_coeff_file(
+                    &params.filename,
+                    &params.format(),
+                    params.read_bytes_lines(),
+                    params.skip_bytes_lines(),
+                )
+                .unwrap(),
+                config::ConvParameters::Wav(params) => {
+                    filters::read_wav(&params.filename, params.channel()).unwrap()
+                }
+                config::ConvParameters::Dummy { length } => {
+                    let mut values = vec![0.0; length];
+                    values[0] = 1.0;
+                    values
+                }
+            };
+
+            let nsegments = ((coeffs.len() as PrcFmt) / (self.npoints as PrcFmt)).ceil() as usize;
+
+            if nsegments == self.nsegments {
+                // Same length, lets keep history
+            } else {
+                // length changed, clearing history
+                self.nsegments = nsegments;
+                let input_f = vec![vec![Complex::zero(); self.npoints + 1]; nsegments];
+                self.input_f = input_f;
+            }
+
+            let mut coeffs_f = vec![vec![Complex::zero(); self.npoints + 1]; nsegments];
+            let mut coeffs_padded = vec![vec![0.0; 2 * self.npoints]; nsegments];
+
+            debug!("conv using {nsegments} segments");
+
+            for (n, coeff) in coeffs.iter().enumerate() {
+                coeffs_padded[n / self.npoints][n % self.npoints] =
+                    coeff / (2 * self.npoints) as PrcFmt;
+            }
+
+            for (segment, segment_f) in coeffs_padded.iter_mut().zip(coeffs_f.iter_mut()) {
+                self.fft
+                    .process_with_scratch(segment, segment_f, &mut self.scratch_fw)
+                    .unwrap();
+            }
+            self.coeffs_f = coeffs_f;
+        } else {
+            // This should never happen unless there is a bug somewhere else
+            panic!("Invalid config change!");
+        }
+    }
+}
+
+// Benchmark API: kernel wrappers for benches/fftconv_kernels.rs (feature = "bench" only).
+
+#[cfg(feature = "bench")]
+pub fn bench_multiply_elements_scalar(
+    result: &mut [Complex<PrcFmt>],
+    slice_a: &[Complex<PrcFmt>],
+    slice_b: &[Complex<PrcFmt>],
+) {
+    multiply_elements_scalar(result, slice_a, slice_b);
+}
+
+#[cfg(feature = "bench")]
+pub fn bench_multiply_add_elements_scalar(
+    result: &mut [Complex<PrcFmt>],
+    slice_a: &[Complex<PrcFmt>],
+    slice_b: &[Complex<PrcFmt>],
+) {
+    multiply_add_elements_scalar(result, slice_a, slice_b);
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "bench"))]
+pub fn bench_has_avx_fma() -> bool {
+    avx::has_avx_fma()
+}
+
+/// # Safety
+/// Caller must verify AVX+FMA availability via `bench_has_avx_fma()`.
+#[cfg(all(target_arch = "x86_64", feature = "bench"))]
+pub unsafe fn bench_multiply_elements_avx_fma(
+    result: &mut [Complex<PrcFmt>],
+    slice_a: &[Complex<PrcFmt>],
+    slice_b: &[Complex<PrcFmt>],
+) {
+    unsafe { avx::multiply_elements_avx_fma(result, slice_a, slice_b) };
+}
+
+/// # Safety
+/// Caller must verify AVX+FMA availability via `bench_has_avx_fma()`.
+#[cfg(all(target_arch = "x86_64", feature = "bench"))]
+pub unsafe fn bench_multiply_add_elements_avx_fma(
+    result: &mut [Complex<PrcFmt>],
+    slice_a: &[Complex<PrcFmt>],
+    slice_b: &[Complex<PrcFmt>],
+) {
+    unsafe { avx::multiply_add_elements_avx_fma(result, slice_a, slice_b) };
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "bench"))]
+/// # Safety
+/// Caller must ensure this is only used on aarch64 where NEON is available.
+pub unsafe fn bench_multiply_elements_neon(
+    result: &mut [Complex<PrcFmt>],
+    slice_a: &[Complex<PrcFmt>],
+    slice_b: &[Complex<PrcFmt>],
+) {
+    unsafe { neon::multiply_elements_neon(result, slice_a, slice_b) };
+}
+
+#[cfg(all(target_arch = "aarch64", feature = "bench"))]
+/// # Safety
+/// Caller must ensure this is only used on aarch64 where NEON is available.
+pub unsafe fn bench_multiply_add_elements_neon(
+    result: &mut [Complex<PrcFmt>],
+    slice_a: &[Complex<PrcFmt>],
+    slice_b: &[Complex<PrcFmt>],
+) {
+    unsafe { neon::multiply_add_elements_neon(result, slice_a, slice_b) };
+}
+
+/// Validate a FFT convolution config.
+pub fn validate_config(conf: &config::ConvParameters) -> Res<()> {
+    match conf {
+        config::ConvParameters::Values { .. } | config::ConvParameters::Dummy { .. } => Ok(()),
+        config::ConvParameters::Raw(params) => {
+            let coeffs = filters::read_coeff_file(
+                &params.filename,
+                &params.format(),
+                params.read_bytes_lines(),
+                params.skip_bytes_lines(),
+            )?;
+            if coeffs.is_empty() {
+                return Err(config::ConfigError::new("Conv coefficients are empty").into());
+            }
+            Ok(())
+        }
+        config::ConvParameters::Wav(params) => {
+            let coeffs = filters::read_wav(&params.filename, params.channel())?;
+            if coeffs.is_empty() {
+                return Err(config::ConfigError::new("Conv coefficients are empty").into());
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::PrcFmt;
+    use crate::config::ConvParameters;
+    use crate::filters::Filter;
+    use crate::filters::fftconv::FftConv;
+    use num_complex::Complex;
+
+    fn is_close(left: PrcFmt, right: PrcFmt, maxdiff: PrcFmt) -> bool {
+        println!("{left} - {right}");
+        (left - right).abs() < maxdiff
+    }
+
+    fn compare_waveforms(left: Vec<PrcFmt>, right: Vec<PrcFmt>, maxdiff: PrcFmt) -> bool {
+        for (val_l, val_r) in left.iter().zip(right.iter()) {
+            if !is_close(*val_l, *val_r, maxdiff) {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn check_result() {
+        let coeffs = vec![0.5, 0.5];
+        let conf = ConvParameters::Values { values: coeffs };
+        let mut filter = FftConv::from_config("test", 8, conf);
+        let mut wave1 = vec![1.0, 1.0, 1.0, 0.0, 0.0, -1.0, 0.0, 0.0];
+        let expected = vec![0.5, 1.0, 1.0, 0.5, 0.0, -0.5, -0.5, 0.0];
+        filter.process_waveform(&mut wave1).unwrap();
+        assert!(compare_waveforms(wave1, expected, 1e-7));
+    }
+
+    #[test]
+    fn check_result_segmented() {
+        let mut coeffs = Vec::<PrcFmt>::new();
+        for m in 0..32 {
+            coeffs.push(m as PrcFmt);
+        }
+        let mut filter = FftConv::new("test", 8, &coeffs);
+        let mut wave1 = vec![0.0 as PrcFmt; 8];
+        let mut wave2 = vec![0.0 as PrcFmt; 8];
+        let mut wave3 = vec![0.0 as PrcFmt; 8];
+        let mut wave4 = vec![0.0 as PrcFmt; 8];
+        let mut wave5 = vec![0.0 as PrcFmt; 8];
+
+        wave1[0] = 1.0;
+        filter.process_waveform(&mut wave1).unwrap();
+        filter.process_waveform(&mut wave2).unwrap();
+        filter.process_waveform(&mut wave3).unwrap();
+        filter.process_waveform(&mut wave4).unwrap();
+        filter.process_waveform(&mut wave5).unwrap();
+
+        let exp1 = Vec::from(&coeffs[0..8]);
+        let exp2 = Vec::from(&coeffs[8..16]);
+        let exp3 = Vec::from(&coeffs[16..24]);
+        let exp4 = Vec::from(&coeffs[24..32]);
+        let exp5 = vec![0.0 as PrcFmt; 8];
+
+        assert!(compare_waveforms(wave1, exp1, 1e-5));
+        assert!(compare_waveforms(wave2, exp2, 1e-5));
+        assert!(compare_waveforms(wave3, exp3, 1e-5));
+        assert!(compare_waveforms(wave4, exp4, 1e-5));
+        assert!(compare_waveforms(wave5, exp5, 1e-5));
+    }
+
+    // FMA rounds differently from scalar; SIMD results may differ by a few ULPs.
+    #[cfg(not(feature = "32bit"))]
+    const SIMD_TOL: PrcFmt = 1e-9;
+    #[cfg(feature = "32bit")]
+    const SIMD_TOL: PrcFmt = 1e-5;
+
+    #[test]
+    fn multiply_elements_scalar_known_values() {
+        use super::multiply_elements_scalar;
+
+        // (1 + 2i) * (3 + 4i) = (3-8) + (4+6)i = -5 + 10i
+        let a = vec![Complex::new(1.0 as PrcFmt, 2.0)];
+        let b = vec![Complex::new(3.0 as PrcFmt, 4.0)];
+        let mut result = vec![Complex::new(0.0 as PrcFmt, 0.0)];
+
+        multiply_elements_scalar(&mut result, &a, &b);
+
+        assert!(is_close(result[0].re, -5.0, SIMD_TOL));
+        assert!(is_close(result[0].im, 10.0, SIMD_TOL));
+    }
+
+    #[test]
+    fn multiply_add_elements_scalar_known_values() {
+        use super::multiply_add_elements_scalar;
+
+        // result starts at (1 + 1i), then += (1 + 2i) * (3 + 4i) = -5 + 10i
+        // expected final: (-4 + 11i)
+        let a = vec![Complex::new(1.0 as PrcFmt, 2.0)];
+        let b = vec![Complex::new(3.0 as PrcFmt, 4.0)];
+        let mut result = vec![Complex::new(1.0 as PrcFmt, 1.0)];
+
+        multiply_add_elements_scalar(&mut result, &a, &b);
+
+        assert!(is_close(result[0].re, -4.0, SIMD_TOL));
+        assert!(is_close(result[0].im, 11.0, SIMD_TOL));
+    }
+}

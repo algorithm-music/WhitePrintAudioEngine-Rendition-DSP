@@ -16,3 +16,7 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+
+# CamillaDSP Rust build artifacts
+camilladsp/target/
+camilladsp/.git/

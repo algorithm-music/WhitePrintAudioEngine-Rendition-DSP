@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+Cargo.lock
+*.raw
+*.wav
+default_config.yml
+active_config.yml
+camilladsp.log
+configs/
+coeffs/
+.venv
+*.csv
+*.exe

@@ -1,0 +1,56 @@
+---
+devices:
+  samplerate: 44100
+  chunksize: 1024
+  target_level: 512
+  enable_rate_adjust: true
+  capture:
+    type: Alsa
+    channels: 2
+    device: "hw:Loopback,0,1"
+    format: S16_LE
+  playback:
+    type: Alsa
+    channels: 2
+    device: "hw:Loopback,0,5"
+    format: S32_LE
+
+filters:
+  lowpass_fir:
+    type: Conv
+    parameters:
+      type: Raw 
+      filename: filter.txt
+
+mixers:
+  monomix:
+    channels:
+      in: 2
+      out: 2
+    mapping:
+      - dest: 0
+        sources:
+          - channel: 0
+            gain: -6
+            inverted: false
+          - channel: 1
+            gain: -6
+            inverted: false
+      - dest: 1
+        sources:
+          - channel: 0
+            gain: -6
+            inverted: false
+          - channel: 1
+            gain: -6
+            inverted: false
+
+pipeline:
+  - type: Mixer
+    name: monomix
+  - type: Filter
+    channels: [0, 1]
+    names:
+      - lowpass_fir
+
+
