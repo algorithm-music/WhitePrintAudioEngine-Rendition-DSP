@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 # Install runtime dependencies + download CamillaDSP prebuilt binary
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libsndfile1 curl && \
+    apt-get install -y --no-install-recommends libsndfile1 libasound2 curl && \
     # Download CamillaDSP v4.1.3 prebuilt binary (linux-amd64, ~3MB)
     curl -fsSL https://github.com/HEnquist/camilladsp/releases/download/v4.1.3/camilladsp-linux-amd64.tar.gz \
       | tar -xz -C /usr/local/bin/ && \
