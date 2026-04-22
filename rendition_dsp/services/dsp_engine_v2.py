@@ -47,7 +47,15 @@ def master_audio(
     target_lufs: float = -14.0,
     target_true_peak: float = -1.0,
 ) -> dict:
-    """Apply 14-stage dynamic mastering chain with Newton-method convergence."""
+    """Apply 14-stage dynamic mastering chain with Newton-method convergence.
+
+    v2.2 enhancements:
+    - Automatic saturation retreat: if true peak exceeds target for 2+
+      consecutive loops, saturation/parallel params are reduced by 20% each
+      iteration to prevent over-driven harmonics from causing clipping.
+    - Crest factor monitoring: tracks peak-to-RMS ratio to detect excessive
+      dynamic range compression.
+    """
     data, sr = sf.read(input_path, dtype="float32")
     if data.ndim == 1:
         data = np.column_stack([data, data])
@@ -63,6 +71,7 @@ def master_audio(
 
     lufs_before = _calculate_lufs_bs1770(left, right, sr)
     peak_before = _measure_true_peak_db(left, right, sr)
+    crest_before = _calculate_crest_factor(left, right)
 
     if params.get("dc_remove_enabled", True):
         left = _remove_dc(left, sr)
@@ -70,8 +79,13 @@ def master_audio(
 
     dither_seed = int.from_bytes(os.urandom(4), "little")
 
+    # Mutable copy of params — convergence loop may auto-reduce saturation.
+    active_params = dict(params)
+
     gain_adjustment = 0.0
     convergence_loops = 0
+    consecutive_peak_violations = 0
+    saturation_reduced = False
     # Holds the most-recent processed output; the final iteration's buffers
     # are what we write to disk (no per-iteration column_stack).
     curr_out_l: np.ndarray | None = None
@@ -87,7 +101,7 @@ def master_audio(
             gc.collect()
 
         out_l, out_r = _apply_dynamic_chain(
-            left, right, sr, params, gain_adjustment, dither_seed,
+            left, right, sr, active_params, gain_adjustment, dither_seed,
         )
         curr_out_l, curr_out_r = out_l, out_r
 
@@ -104,6 +118,32 @@ def master_audio(
         if abs(lufs_diff) < CONVERGENCE_TOLERANCE_DB and peak_safe:
             break
 
+        # Track consecutive peak violations for saturation retreat
+        if current_peak > target_true_peak:
+            consecutive_peak_violations += 1
+        else:
+            consecutive_peak_violations = 0
+
+        # Saturation auto-retreat: if TP exceeded for 2+ consecutive loops,
+        # reduce saturation/parallel params by 20% to give the limiter headroom.
+        if consecutive_peak_violations >= 2:
+            _SAT_RETREAT_KEYS = [
+                "transformer_saturation", "transformer_mix",
+                "triode_drive", "triode_mix",
+                "tape_saturation", "tape_mix",
+                "parallel_wet",
+            ]
+            for sk in _SAT_RETREAT_KEYS:
+                old_val = active_params.get(sk, 0.0)
+                if old_val > 0.01:
+                    new_val = round(old_val * 0.80, 4)
+                    active_params[sk] = new_val
+            saturation_reduced = True
+            logger.warning(
+                f"Loop {convergence_loops}: TP exceeded {consecutive_peak_violations}x "
+                f"consecutively → saturation params reduced by 20%"
+            )
+
         # Newton-method proportional control: 0.85 learning rate compensates
         # for compressor gain reduction (gain/LUFS relationship is near-linear).
         gain_adjustment -= lufs_diff * 0.85
@@ -119,6 +159,7 @@ def master_audio(
     lufs_after = _calculate_lufs_bs1770(curr_out_l, curr_out_r, sr)
     peak_after = _measure_true_peak_db(curr_out_l, curr_out_r, sr)
     dr_after = _calculate_dynamic_range(curr_out_l, curr_out_r, sr)
+    crest_after = _calculate_crest_factor(curr_out_l, curr_out_r)
 
     # Single column_stack right before write.
     best_output = np.column_stack([curr_out_l, curr_out_r]).astype(
@@ -143,11 +184,14 @@ def master_audio(
         "true_peak_before": round(peak_before, 1),
         "true_peak_after": round(peak_after, 1),
         "dynamic_range_after": round(dr_after, 1),
+        "crest_factor_before_db": round(crest_before, 1),
+        "crest_factor_after_db": round(crest_after, 1),
+        "saturation_reduced": saturation_reduced,
         "convergence_loops": convergence_loops,
         "gain_adjustment_db": round(gain_adjustment, 2),
         "target_lufs": target_lufs,
         "target_true_peak": target_true_peak,
-        "engine_version": "v2.1_kaioken_optimized",
+        "engine_version": "v2.2_guardrail",
     }
 
 
@@ -808,6 +852,22 @@ def _calculate_dynamic_range(
         20.0 * np.log10(max(mp, LOG_FLOOR))
         - 20.0 * np.log10(max(mr, LOG_FLOOR))
     )
+
+
+def _calculate_crest_factor(
+    l: np.ndarray, r: np.ndarray,
+) -> float:
+    """Crest factor in dB: peak-to-RMS ratio.
+
+    A healthy master typically has 6-12 dB crest factor.
+    Below 4 dB indicates over-compression / over-limiting.
+    """
+    mono = (l + r) * 0.5
+    rms = float(np.sqrt(np.mean(mono ** 2)))
+    peak = float(np.max(np.abs(mono)))
+    if rms < LOG_FLOOR:
+        return 0.0
+    return 20.0 * np.log10(max(peak, LOG_FLOOR) / rms)
 
 
 def _db_to_linear(db: float) -> float:
