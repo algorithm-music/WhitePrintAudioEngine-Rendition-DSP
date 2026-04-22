@@ -1,31 +1,15 @@
-# ===== Stage 1: Build CamillaDSP from source =====
-FROM rust:1.85-slim AS camilladsp-builder
-
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        pkg-config libasound2-dev libssl-dev && \
-    rm -rf /var/lib/apt/lists/*
-
-COPY camilladsp/ /build/camilladsp/
-WORKDIR /build/camilladsp
-
-# Build CamillaDSP without audio device backends (file I/O only)
-# No default features = no websocket, just core DSP
-RUN cargo build --release --no-default-features && \
-    strip target/release/camilladsp && \
-    cp target/release/camilladsp /usr/local/bin/camilladsp
-
-# ===== Stage 2: Python runtime =====
 FROM python:3.12-slim
 
-# Install runtime dependencies
+# Install runtime dependencies + download CamillaDSP prebuilt binary
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libsndfile1 && \
+    apt-get install -y --no-install-recommends libsndfile1 curl && \
+    # Download CamillaDSP v4.1.3 prebuilt binary (linux-amd64, ~3MB)
+    curl -fsSL https://github.com/HEnquist/camilladsp/releases/download/v4.1.3/camilladsp-linux-amd64.tar.gz \
+      | tar -xz -C /usr/local/bin/ && \
+    chmod +x /usr/local/bin/camilladsp && \
+    apt-get purge -y curl && \
+    apt-get autoremove -y && \
     rm -rf /var/lib/apt/lists/*
-
-# Copy CamillaDSP binary from builder stage
-COPY --from=camilladsp-builder /usr/local/bin/camilladsp /usr/local/bin/camilladsp
-RUN chmod +x /usr/local/bin/camilladsp
 
 WORKDIR /app
 

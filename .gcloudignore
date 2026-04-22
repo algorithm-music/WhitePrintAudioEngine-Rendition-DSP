@@ -1,0 +1,14 @@
+# Exclude CamillaDSP source (binary is downloaded during build)
+camilladsp/
+
+# Standard excludes
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.egg-info/
+.env
+.env.*
+venv/
+.venv/
+*.log
